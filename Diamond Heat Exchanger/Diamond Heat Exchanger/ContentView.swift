@@ -304,6 +304,16 @@ final class RadiatorCAEngine: ObservableObject {
         + y * gridSize
         + z * gridSize * gridSize
     }
+    func stop() {
+        guard isRunning else {
+            return
+        }
+
+        isRunning = false
+
+        applyPortStates()
+        evaluateSimulation()
+    }
 
     private func isValid(_ point: GridPoint) -> Bool {
         point.x >= 0 &&
@@ -1895,33 +1905,39 @@ struct RadiatorSceneView: UIViewRepresentable {
     private func addCamera(
         to scene: SCNScene
     ) {
+        let targetNode = SCNNode()
+        targetNode.name = "cameraTarget"
+        targetNode.position = SCNVector3Zero
 
-        let camera =
-            SCNCamera()
+        scene.rootNode.addChildNode(targetNode)
 
-        camera.fieldOfView =
-            60.0
+        let camera = SCNCamera()
+        camera.fieldOfView = 52
+        camera.zNear = 0.001
+        camera.zFar = 100
 
-        let cameraNode =
-            SCNNode()
+        let cameraNode = SCNNode()
+        cameraNode.name = "mainCamera"
+        cameraNode.camera = camera
 
-        cameraNode.camera =
-            camera
-
-        cameraNode.position =
-            SCNVector3(
-                0,
-                Float(gridSize) * cellSize * 0.65,
-                Float(gridSize) * cellSize * 1.45
-            )
-
-        cameraNode.look(
-            at: SCNVector3Zero
+        // The rendered cube is approximately:
+        // gridSize * cellSize = 21 * 0.18 = 3.78 SceneKit units wide.
+        //
+        // This position frames the full lattice diagonally.
+        cameraNode.position = SCNVector3(
+            4.8,
+            3.8,
+            5.6
         )
 
-        scene.rootNode.addChildNode(
-            cameraNode
+        let lookAt = SCNLookAtConstraint(
+            target: targetNode
         )
+        lookAt.isGimbalLockEnabled = true
+
+        cameraNode.constraints = [lookAt]
+
+        scene.rootNode.addChildNode(cameraNode)
     }
 }
 
@@ -1978,22 +1994,120 @@ private extension SCNNode {
     }
 }
 
-// MARK: - Content View
-
 struct ContentView: View {
 
-    @StateObject
-    private var engine =
-        RadiatorCAEngine()
+    @StateObject private var engine = RadiatorCAEngine()
 
     var body: some View {
+        ZStack {
+            VStack(spacing: 0) {
+                headerRibbon
 
-        VStack(
-            spacing: 0
-        ) {
+                scenePanel
 
-            header
+                metricsRibbon
 
+                controlsRibbon
+            }
+
+            if engine.isRunning {
+                progressOverlay
+                    .transition(.opacity)
+            }
+        }
+        .background(Color.black)
+        .foregroundStyle(.white)
+        .preferredColorScheme(.dark)
+        .animation(
+            .easeInOut(duration: 0.20),
+            value: engine.isRunning
+        )
+    }
+
+    // MARK: - Header Ribbon
+
+    private var headerRibbon: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "cube.transparent")
+                .font(.title3)
+                .foregroundStyle(.cyan)
+
+            VStack(
+                alignment: .leading,
+                spacing: 2
+            ) {
+                Text("Diamond Heat Exchanger")
+                    .font(.headline.bold())
+
+                Text(
+                    "3D Cellular Automaton • 1 GJ Thermal Load"
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+
+            Spacer()
+
+            statusBadge
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(Color(white: 0.075))
+        .overlay(alignment: .bottom) {
+            Divider()
+                .overlay(Color.white.opacity(0.10))
+        }
+    }
+
+    private var statusBadge: some View {
+        HStack(spacing: 6) {
+            Circle()
+                .fill(statusColor)
+                .frame(width: 8, height: 8)
+
+            Text(statusText)
+                .font(.caption2.bold())
+                .foregroundStyle(statusColor)
+        }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 6)
+        .background(
+            statusColor.opacity(0.13),
+            in: Capsule()
+        )
+    }
+
+    private var statusText: String {
+        if engine.isRunning {
+            return "RUNNING"
+        }
+
+        return designIsValid
+            ? "VALID"
+            : "CHECK DESIGN"
+    }
+
+    private var statusColor: Color {
+        if engine.isRunning {
+            return .cyan
+        }
+
+        return designIsValid
+            ? .green
+            : .orange
+    }
+
+    private var designIsValid: Bool {
+        engine.metrics.waterConnected &&
+        engine.metrics.airConnected &&
+        engine.metrics.printable &&
+        !engine.metrics.channelsOverlap
+    }
+
+    // MARK: - Large Scene
+
+    private var scenePanel: some View {
+        ZStack(alignment: .topLeading) {
             RadiatorSceneView(
                 cells: engine.cells,
                 gridSize: engine.gridSize,
@@ -2003,267 +2117,500 @@ struct ContentView: View {
                 maxWidth: .infinity,
                 maxHeight: .infinity
             )
+            .background(Color.black)
 
-            metricsPanel
+            sceneLegend
+                .padding(14)
 
-            controls
+            sceneStatusReadout
+                .padding(14)
         }
+        .layoutPriority(1)
+    }
+
+    private var sceneLegend: some View {
+        VStack(
+            alignment: .leading,
+            spacing: 5
+        ) {
+            Text("LATTICE VIEW")
+                .font(.caption2.bold())
+                .foregroundStyle(.secondary)
+
+            legendRow(
+                color: .purple,
+                label: "Aluminum"
+            )
+
+            legendRow(
+                color: .blue,
+                label: "Water"
+            )
+
+            legendRow(
+                color: .green,
+                label: "Air inlet"
+            )
+
+            legendRow(
+                color: .orange,
+                label: "Air outlet"
+            )
+
+            Text("Drag to rotate • Pinch to zoom")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .padding(.top, 3)
+        }
+        .padding(9)
         .background(
-            Color.black
-        )
-        .foregroundStyle(
-            .white
+            Color.black.opacity(0.72),
+            in: RoundedRectangle(
+                cornerRadius: 9
+            )
         )
     }
 
-    // MARK: Header
-
-    private var header: some View {
-
+    private var sceneStatusReadout: some View {
         VStack(
+            alignment: .trailing,
             spacing: 4
         ) {
+            Text("GENERATION \(engine.generation)")
+                .font(
+                    .system(
+                        .caption,
+                        design: .monospaced
+                    )
+                    .bold()
+                )
+                .foregroundStyle(.cyan)
 
             Text(
-                "DIAMOND HEAT EXCHANGER"
+                String(
+                    format: "%.3f MW",
+                    engine.metrics.heatRejectedMW
+                )
             )
             .font(
-                .title2.bold()
+                .system(
+                    .caption,
+                    design: .monospaced
+                )
             )
-
-            Text(
-                "3D Cellular Automaton • 1 GJ Thermal Load"
-            )
-            .font(
-                .caption
-            )
-            .foregroundStyle(
-                .secondary
-            )
+            .foregroundStyle(.orange)
         }
-        .padding(
-            .vertical,
-            10
+        .padding(9)
+        .background(
+            Color.black.opacity(0.72),
+            in: RoundedRectangle(
+                cornerRadius: 9
+            )
+        )
+        .frame(
+            maxWidth: .infinity,
+            maxHeight: .infinity,
+            alignment: .topTrailing
         )
     }
 
-    // MARK: Metrics
+    private func legendRow(
+        color: Color,
+        label: String
+    ) -> some View {
+        HStack(spacing: 6) {
+            Circle()
+                .fill(color)
+                .frame(width: 7, height: 7)
 
-    private var metricsPanel: some View {
+            Text(label)
+                .font(.caption2)
+        }
+    }
 
+    // MARK: - Metrics Ribbon
+
+    private var metricsRibbon: some View {
         ScrollView(
             .horizontal,
             showsIndicators: false
         ) {
-
-            HStack(
-                spacing: 14
-            ) {
-
-                metric(
-                    title: "ALUMINUM",
+            HStack(spacing: 8) {
+                metricPill(
+                    title: "Fitness",
                     value: String(
-                        format: "%.2f kg",
-                        engine.metrics.aluminumMassKg
-                    )
+                        format: "%.2e",
+                        engine.metrics.fitness
+                    ),
+                    color: .mint
                 )
 
-                metric(
-                    title: "SURFACE",
-                    value: String(
-                        format: "%.3f m²",
-                        engine.metrics.aluminumSurfaceAreaM2
-                    )
-                )
-
-                metric(
-                    title: "WATER",
-                    value: String(
-                        format: "%.5f m³/s",
-                        engine.metrics.waterFlowM3S
-                    )
-                )
-
-                metric(
-                    title: "AIR",
-                    value: String(
-                        format: "%.4f m³/s",
-                        engine.metrics.airFlowM3S
-                    )
-                )
-
-                metric(
-                    title: "ΔP WATER",
-                    value: String(
-                        format: "%.0f Pa",
-                        engine.metrics.waterPressureDropPa
-                    )
-                )
-
-                metric(
-                    title: "ΔP AIR",
-                    value: String(
-                        format: "%.0f Pa",
-                        engine.metrics.airPressureDropPa
-                    )
-                )
-
-                metric(
-                    title: "PUMP",
-                    value: String(
-                        format: "%.2f kW",
-                        engine.metrics.pumpPowerW / 1000.0
-                    )
-                )
-
-                metric(
-                    title: "FAN",
-                    value: String(
-                        format: "%.2f kW",
-                        engine.metrics.fanPowerW / 1000.0
-                    )
-                )
-
-                metric(
-                    title: "HEAT",
-                    value: String(
-                        format: "%.3f MW",
-                        engine.metrics.heatRejectedMW
-                    )
-                )
-
-                metric(
-                    title: "1 GJ TIME",
-                    value: String(
-                        format: "%.1f s",
-                        engine.metrics.removalTimeS
-                    )
-                )
-
-                metric(
-                    title: "MAX TEMP",
+                metricPill(
+                    title: "Max Temp",
                     value: String(
                         format: "%.1f °C",
                         engine.metrics.maximumTemperatureC
-                    )
+                    ),
+                    color: temperatureColor
                 )
 
-                metric(
-                    title: "FITNESS",
+                metricPill(
+                    title: "1 GJ Time",
+                    value: formattedRemovalTime,
+                    color: .orange
+                )
+
+                metricPill(
+                    title: "Aluminum",
                     value: String(
-                        format: "%.3e",
-                        engine.metrics.fitness
-                    )
+                        format: "%.2f kg",
+                        engine.metrics.aluminumMassKg
+                    ),
+                    color: .purple
+                )
+
+                metricPill(
+                    title: "Surface",
+                    value: String(
+                        format: "%.3f m²",
+                        engine.metrics.aluminumSurfaceAreaM2
+                    ),
+                    color: .pink
+                )
+
+                metricPill(
+                    title: "Water",
+                    value: String(
+                        format: "%.5f m³/s",
+                        engine.metrics.waterFlowM3S
+                    ),
+                    color: .blue
+                )
+
+                metricPill(
+                    title: "Air",
+                    value: String(
+                        format: "%.4f m³/s",
+                        engine.metrics.airFlowM3S
+                    ),
+                    color: .cyan
+                )
+
+                metricPill(
+                    title: "Pump",
+                    value: String(
+                        format: "%.2f kW",
+                        engine.metrics.pumpPowerW / 1000.0
+                    ),
+                    color: .blue
+                )
+
+                metricPill(
+                    title: "Fan",
+                    value: String(
+                        format: "%.2f kW",
+                        engine.metrics.fanPowerW / 1000.0
+                    ),
+                    color: .cyan
+                )
+
+                healthPill(
+                    title: "Water Path",
+                    isPassing: engine.metrics.waterConnected
+                )
+
+                healthPill(
+                    title: "Air Path",
+                    isPassing: engine.metrics.airConnected
+                )
+
+                healthPill(
+                    title: "Printable",
+                    isPassing: engine.metrics.printable
                 )
             }
-            .padding(
-                .horizontal,
-                12
-            )
-            .padding(
-                .vertical,
-                8
-            )
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+        }
+        .background(Color(white: 0.065))
+        .overlay(alignment: .top) {
+            Divider()
+                .overlay(Color.white.opacity(0.10))
         }
     }
 
-    private func metric(
+    private func metricPill(
         title: String,
-        value: String
+        value: String,
+        color: Color
     ) -> some View {
-
         VStack(
+            alignment: .leading,
             spacing: 3
         ) {
-
-            Text(title)
-                .font(
-                    .caption2.bold()
-                )
-                .foregroundStyle(
-                    .secondary
-                )
+            Text(title.uppercased())
+                .font(.caption2.bold())
+                .foregroundStyle(.secondary)
 
             Text(value)
                 .font(
-                    .caption.monospacedDigit()
+                    .system(
+                        .caption,
+                        design: .monospaced
+                    )
+                    .bold()
                 )
+                .foregroundStyle(color)
         }
-        .frame(
-            minWidth: 90
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(
+            Color.white.opacity(0.06),
+            in: RoundedRectangle(
+                cornerRadius: 8
+            )
         )
     }
 
-    // MARK: Controls
+    private func healthPill(
+        title: String,
+        isPassing: Bool
+    ) -> some View {
+        HStack(spacing: 6) {
+            Image(
+                systemName: isPassing
+                    ? "checkmark.circle.fill"
+                    : "xmark.circle.fill"
+            )
+            .foregroundStyle(
+                isPassing ? Color.green : Color.red
+            )
 
-    private var controls: some View {
-
-        HStack(
-            spacing: 10
-        ) {
-
-            Button(
-                "RESET"
+            VStack(
+                alignment: .leading,
+                spacing: 2
             ) {
+                Text(title.uppercased())
+                    .font(.caption2.bold())
+                    .foregroundStyle(.secondary)
 
+                Text(
+                    isPassing
+                        ? "Connected"
+                        : "Check"
+                )
+                .font(.caption.bold())
+                .foregroundStyle(
+                    isPassing ? Color.green : Color.red
+                )
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(
+            Color.white.opacity(0.06),
+            in: RoundedRectangle(
+                cornerRadius: 8
+            )
+        )
+    }
+
+    // MARK: - Controls Ribbon
+
+    private var controlsRibbon: some View {
+        HStack(spacing: 9) {
+            Button {
                 engine.reset()
-            }
-
-            Button(
-                "EVOLVE"
-            ) {
-
-                engine.evolve(
-                    generations: 10
+            } label: {
+                Label(
+                    "Reset",
+                    systemImage: "arrow.counterclockwise"
                 )
             }
+            .buttonStyle(.bordered)
+            .disabled(engine.isRunning)
 
-            Button(
-                "OPTIMIZE"
-            ) {
-
-                engine.optimize(
-                    generations: 50
+            Button {
+                engine.evolve(generations: 1)
+            } label: {
+                Label(
+                    "Step",
+                    systemImage: "forward.frame.fill"
                 )
+            }
+            .buttonStyle(.bordered)
+            .disabled(engine.isRunning)
+
+            Button {
+                engine.evolve(generations: 20)
+            } label: {
+                Label(
+                    "Run",
+                    systemImage: "play.fill"
+                )
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(engine.isRunning)
+
+            Button {
+                engine.optimize(generations: 50)
+            } label: {
+                Label(
+                    "Optimize",
+                    systemImage: "wand.and.stars"
+                )
+            }
+            .buttonStyle(.bordered)
+            .disabled(engine.isRunning)
+
+            if engine.isRunning {
+                Button(
+                    role: .destructive
+                ) {
+                    engine.stop()
+                } label: {
+                    Label(
+                        "Stop",
+                        systemImage: "stop.fill"
+                    )
+                }
+                .buttonStyle(.bordered)
             }
 
             Spacer()
 
-            VStack(
-                alignment: .trailing,
-                spacing: 2
-            ) {
+            Group {
+                if engine.isRunning {
+                    ProgressView()
+                        .controlSize(.small)
+
+                    Text(
+                        "Evaluating generation \(engine.generation)"
+                    )
+                } else {
+                    Text(
+                        "Step = one CA update • Run = 20 updates"
+                    )
+                }
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 9)
+        .background(Color(white: 0.085))
+        .overlay(alignment: .top) {
+            Divider()
+                .overlay(Color.white.opacity(0.10))
+        }
+    }
+
+    // MARK: - Progress Overlay
+
+    private var progressOverlay: some View {
+        ZStack {
+            Color.black
+                .opacity(0.32)
+                .ignoresSafeArea()
+                .allowsHitTesting(false)
+
+            VStack(spacing: 12) {
+                ProgressView()
+                    .controlSize(.large)
+                    .tint(.cyan)
+
+                Text("Simulation Running")
+                    .font(.headline)
 
                 Text(
-                    "Generation \(engine.generation)"
+                    "Evaluating generation \(engine.generation)"
                 )
-                .font(
-                    .caption.monospacedDigit()
-                )
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
 
                 Text(
-                    engine.metrics.waterConnected &&
-                    engine.metrics.airConnected
-                    ? "FLOW CONNECTED"
-                    : "FLOW DISCONNECTED"
+                    "The scene remains visible and updates after each CA generation."
                 )
-                .font(
-                    .caption2.bold()
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+
+                Button(
+                    role: .destructive
+                ) {
+                    engine.stop()
+                } label: {
+                    Label(
+                        "Stop",
+                        systemImage: "stop.fill"
+                    )
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.red)
+            }
+            .padding(22)
+            .frame(width: 310)
+            .background(
+                Color(white: 0.10),
+                in: RoundedRectangle(
+                    cornerRadius: 16
                 )
-                .foregroundStyle(
-                    engine.metrics.waterConnected &&
-                    engine.metrics.airConnected
-                    ? .green
-                    : .red
+            )
+            .overlay {
+                RoundedRectangle(
+                    cornerRadius: 16
+                )
+                .stroke(
+                    Color.cyan.opacity(0.32),
+                    lineWidth: 1
                 )
             }
         }
-        .padding(
-            10
+    }
+
+    // MARK: - Formatting
+
+    private var temperatureColor: Color {
+        let temperature = engine.metrics.maximumTemperatureC
+
+        if temperature >= 110 {
+            return .red
+        }
+
+        if temperature >= 85 {
+            return .orange
+        }
+
+        return .green
+    }
+
+    private var formattedRemovalTime: String {
+        let time = engine.metrics.removalTimeS
+
+        guard time.isFinite else {
+            return "—"
+        }
+
+        if time >= 3_600 {
+            return String(
+                format: "%.1f hr",
+                time / 3_600
+            )
+        }
+
+        if time >= 60 {
+            return String(
+                format: "%.1f min",
+                time / 60
+            )
+        }
+
+        return String(
+            format: "%.1f s",
+            time
         )
     }
 }
-
 // MARK: - Preview
 
 #Preview {
