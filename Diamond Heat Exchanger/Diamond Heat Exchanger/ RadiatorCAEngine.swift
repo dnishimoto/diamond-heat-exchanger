@@ -924,7 +924,41 @@ final class RadiatorCAEngine: ObservableObject {
                 waterSpecificHeat
             )
     }
+    private func applyWaterInletTemperature(
+        to cells: inout [RadiatorCell]
+    ) {
 
+        let waterFlowM3S = calculateWaterFlow(cells)
+        
+        let massFlowKgS =
+            max(
+                waterFlowM3S * waterDensityKgM3,
+                0.000001
+            )
+
+        let temperatureRiseC =
+            requiredHeatRateW /
+            (
+                massFlowKgS *
+                waterSpecificHeat
+            )
+
+        let inletTemperatureC =
+            ambientTemperatureC +
+            temperatureRiseC
+
+        for port in waterPorts
+        where port.kind == .waterInlet {
+
+            guard let index = indexFor(port.point)
+            else {
+                continue
+            }
+
+            cells[index].temperatureC =
+                inletTemperatureC
+        }
+    }
     private var datacenterWaterInletTemperatureC: Double {
 
         /*
@@ -947,79 +981,19 @@ final class RadiatorCAEngine: ObservableObject {
 
     private func advanceThermalField() {
 
-        let previousCells =
-            cells
-
-        var nextCells =
-            previousCells
+        let previousCells = cells
+        var nextCells = previousCells
 
         thermalSimulationTimeS +=
             thermalTimeStepS
 
         // -------------------------------------------------------------
-        // 1. INJECT DATACENTER HEAT INTO WATER
+        // 1. WATER INLET THERMAL BOUNDARY
         // -------------------------------------------------------------
 
-        let remainingDatacenterEnergy =
-            max(
-                0.0,
-                datacenterHeatLoadJ -
-                datacenterEnergyInjectedJ
-            )
-
-        let desiredInjection =
-            min(
-                requiredHeatRateW *
-                thermalTimeStepS,
-                remainingDatacenterEnergy
-            )
-
-        /*
-         Divide the datacenter heat among the water inlet cells.
-
-         This is the actual source of the thermal load.
-         */
-
-        let waterInletIndices =
-            previousCells.indices.filter {
-                previousCells[$0].state ==
-                .waterInlet
-            }
-
-        if !waterInletIndices.isEmpty {
-
-            let energyPerInlet =
-                desiredInjection /
-                Double(waterInletIndices.count)
-
-            for index in waterInletIndices {
-
-                let waterMass =
-                    waterDensityKgM3 *
-                    cellVolumeM3
-
-                let deltaT =
-                    energyPerInlet /
-                    max(
-                        waterMass *
-                        waterSpecificHeat,
-                        1.0e-12
-                    )
-
-                nextCells[index].temperatureC =
-                    previousCells[index].temperatureC +
-                    min(
-                        deltaT,
-                        maximumTemperatureChangePerStepC
-                    )
-
-                nextCells[index].heatJ +=
-                    energyPerInlet
-            }
-
-            datacenterEnergyInjectedJ +=
-                desiredInjection
-        }
+        applyWaterInletTemperature(
+            to: &nextCells
+        )
 
         // -------------------------------------------------------------
         // 2. WATER → ALUMINUM
@@ -1027,8 +1001,7 @@ final class RadiatorCAEngine: ObservableObject {
 
         for index in previousCells.indices {
 
-            let current =
-                previousCells[index]
+            let current = previousCells[index]
 
             guard current.state == .water ||
                   current.state == .waterInlet ||
@@ -1037,14 +1010,12 @@ final class RadiatorCAEngine: ObservableObject {
                 continue
             }
 
-            let point =
-                pointFor(index)
+            let point = pointFor(index)
 
             let waterTemperature =
                 current.temperatureC
 
-            for neighborPoint in
-                neighborPoints(point) {
+            for neighborPoint in neighborPoints(point) {
 
                 guard let neighborIndex =
                     indexFor(neighborPoint)
@@ -1055,8 +1026,7 @@ final class RadiatorCAEngine: ObservableObject {
                 let neighbor =
                     previousCells[neighborIndex]
 
-                guard neighbor.state ==
-                        .aluminum
+                guard neighbor.state == .aluminum
                 else {
                     continue
                 }
@@ -1065,7 +1035,8 @@ final class RadiatorCAEngine: ObservableObject {
                     waterTemperature -
                     neighbor.temperatureC
 
-                guard deltaT > 0 else {
+                guard deltaT > 0
+                else {
                     continue
                 }
 
@@ -1100,7 +1071,8 @@ final class RadiatorCAEngine: ObservableObject {
                         availableWaterEnergy
                     )
 
-                guard transferred > 0 else {
+                guard transferred > 0
+                else {
                     continue
                 }
 
@@ -1162,17 +1134,14 @@ final class RadiatorCAEngine: ObservableObject {
 
         for index in previousCells.indices {
 
-            guard previousCells[index].state ==
-                    .aluminum
+            guard previousCells[index].state == .aluminum
             else {
                 continue
             }
 
-            let point =
-                pointFor(index)
+            let point = pointFor(index)
 
-            for neighborPoint in
-                neighborPoints(point) {
+            for neighborPoint in neighborPoints(point) {
 
                 guard let neighborIndex =
                     indexFor(neighborPoint)
@@ -1180,7 +1149,8 @@ final class RadiatorCAEngine: ObservableObject {
                     continue
                 }
 
-                guard neighborIndex > index else {
+                guard neighborIndex > index
+                else {
                     continue
                 }
 
@@ -1197,10 +1167,10 @@ final class RadiatorCAEngine: ObservableObject {
                     previousCells[neighborIndex].temperatureC
 
                 let deltaT =
-                    temperatureB -
-                    temperatureA
+                    temperatureB - temperatureA
 
-                guard abs(deltaT) > 0.001 else {
+                guard abs(deltaT) > 0.001
+                else {
                     continue
                 }
 
@@ -1223,11 +1193,6 @@ final class RadiatorCAEngine: ObservableObject {
                 nextCells[neighborIndex].temperatureC -=
                     limitedTransfer
 
-                /*
-                 Keep heat energy approximately represented
-                 consistently with the temperature field.
-                 */
-
                 synchronizeCellHeat(
                     index: index,
                     cells: &nextCells
@@ -1246,20 +1211,17 @@ final class RadiatorCAEngine: ObservableObject {
 
         for index in previousCells.indices {
 
-            guard previousCells[index].state ==
-                    .aluminum
+            guard previousCells[index].state == .aluminum
             else {
                 continue
             }
 
-            let point =
-                pointFor(index)
+            let point = pointFor(index)
 
             let aluminumTemperature =
                 previousCells[index].temperatureC
 
-            for neighborPoint in
-                neighborPoints(point) {
+            for neighborPoint in neighborPoints(point) {
 
                 guard let neighborIndex =
                     indexFor(neighborPoint)
@@ -1282,7 +1244,8 @@ final class RadiatorCAEngine: ObservableObject {
                     aluminumTemperature -
                     airTemperature
 
-                guard deltaT > 0 else {
+                guard deltaT > 0
+                else {
                     continue
                 }
 
@@ -1317,7 +1280,8 @@ final class RadiatorCAEngine: ObservableObject {
                         availableAluminumEnergy
                     )
 
-                guard transferred > 0 else {
+                guard transferred > 0
+                else {
                     continue
                 }
 
@@ -1373,7 +1337,7 @@ final class RadiatorCAEngine: ObservableObject {
         }
 
         // -------------------------------------------------------------
-        // 5. ADVECT WATER ENERGY TOWARD OUTLETS
+        // 5. ADVECT WATER
         // -------------------------------------------------------------
 
         advectWaterTemperature(
@@ -1382,7 +1346,7 @@ final class RadiatorCAEngine: ObservableObject {
         )
 
         // -------------------------------------------------------------
-        // 6. ADVECT AIR ENERGY TOWARD OUTLETS
+        // 6. ADVECT AIR
         // -------------------------------------------------------------
 
         advectAirTemperature(
@@ -1391,7 +1355,7 @@ final class RadiatorCAEngine: ObservableObject {
         )
 
         // -------------------------------------------------------------
-        // 7. KEEP TEMPERATURES NUMERICALLY STABLE
+        // 7. NUMERICAL TEMPERATURE LIMIT
         // -------------------------------------------------------------
 
         for index in nextCells.indices {
@@ -1407,17 +1371,14 @@ final class RadiatorCAEngine: ObservableObject {
         }
 
         // -------------------------------------------------------------
-        // 8. RESTORE INLET CONDITIONS
+        // 8. RESTORE THERMAL BOUNDARIES
         // -------------------------------------------------------------
 
         applyThermalBoundaryConditions(
             to: &nextCells
         )
 
-        cells =
-            nextCells
-        
-        transferWaterToAluminum()
+        cells = nextCells
     }
 
     // MARK: - Thermal Transfer Accounting
