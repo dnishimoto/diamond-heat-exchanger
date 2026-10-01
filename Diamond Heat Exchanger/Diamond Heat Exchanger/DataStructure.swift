@@ -121,6 +121,9 @@ struct RadiatorCell: Identifiable {
     // MARK: CA State
 
     var generation: Int = 0
+    
+    var flowRateM3S : Double  = 0.0
+    var pressurePa : Double = 0.0
 }
 
 // MARK: - Ports
