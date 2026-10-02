@@ -124,6 +124,11 @@ struct RadiatorCell: Identifiable {
     
     var flowRateM3S : Double  = 0.0
     var pressurePa : Double = 0.0
+    
+    var airMassKg : Double = 0.0
+    var massKg : Double = 0.0
+    var airSpecificHeatJPerKgK: Double = 0.0
+    var heatCapacityJPerK : Double = 0.0
 }
 
 // MARK: - Ports

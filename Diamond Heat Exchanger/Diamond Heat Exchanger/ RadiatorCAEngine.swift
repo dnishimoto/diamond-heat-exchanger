@@ -14,7 +14,13 @@ import Foundation
 
 @MainActor
 final class RadiatorCAEngine: ObservableObject {
+    
+    private let waterHeatTransferCoefficient = 3_500_000.0
+
+    private let airHeatTransferCoefficient = 75_000.0
+    
     private let maximumAluminumFraction = 0.60
+    private let airSpecificHeatJPerKgK = 1005.0
     
     private let thermalTimeStepS = 0.02
     private let datacenterHeatLoadJ = 1_000_000_000.0
@@ -23,6 +29,7 @@ final class RadiatorCAEngine: ObservableObject {
     @Published private(set) var datacenterEnergyInjectedJ: Double = 0
     @Published private(set) var waterToAluminumEnergyJ: Double = 0
     @Published private(set) var airEnergyRemovedJ: Double = 0
+    @Published private(set) var airEnergyRemovedThisStepJ : Double = 0
     @Published private(set) var aluminumToAirEnergyJ : Double = 0
 
     private var thermalSimulationTimeS: Double = 0
@@ -104,10 +111,7 @@ final class RadiatorCAEngine: ObservableObject {
     // MARK: - Thermal Simulation
 
   
-    private let waterHeatTransferCoefficient = 3500.0
-
-    private let airHeatTransferCoefficient = 75.0
-
+  
     /*
      Aluminum conduction relaxation.
 
@@ -2272,6 +2276,11 @@ final class RadiatorCAEngine: ObservableObject {
             ? waterToAluminumThisStepJ /
               targetWaterToAluminumStepJ
             : 0.0
+        
+        let airEnergyExportedThisStepJ = exportAirOutletEnergy(from: &nextCells)
+
+        airEnergyRemovedJ += airEnergyExportedThisStepJ
+        airEnergyRemovedThisStepJ = airEnergyExportedThisStepJ
 
         print(
             """
@@ -3099,7 +3108,36 @@ final class RadiatorCAEngine: ObservableObject {
                 )
         }
     }
+    private func exportAirOutletEnergy(
+        from cells: inout [RadiatorCell]
+    ) -> Double {
+        var removedEnergyJ = 0.0
 
+        for port in airPorts where port.kind == .airOutlet {
+            guard let index = indexFor(port.point) else { continue }
+
+            let state = cells[index].state
+            guard state.isAir || state == .airOutlet else { continue }
+
+            let airMassKg = max(cells[index].massKg, 0.0)
+            let heatCapacityJPerK = airMassKg * airSpecificHeatJPerKgK
+
+            guard heatCapacityJPerK > 0 else { continue }
+
+            let deltaTemperatureC =
+                max(0.0, cells[index].temperatureC - airInletTemperatureC)
+
+            let exportedJ = deltaTemperatureC * heatCapacityJPerK
+
+            removedEnergyJ += exportedJ
+
+            // Outlet is replenished by incoming ambient/inlet air for the next step.
+            cells[index].temperatureC = airInletTemperatureC
+            cells[index].heatJ = 0.0
+        }
+
+        return removedEnergyJ
+    }
     // MARK: - Air Advection
 
     private func advectAirTemperature(
