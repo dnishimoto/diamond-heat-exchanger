@@ -937,7 +937,16 @@ final class RadiatorCAEngine: ObservableObject {
             // No structural path to the build platform -> FLOATING.
             lattice[index].state = .air
             lattice[index].temperatureC = ambientTemperatureC
-            lattice[index].heatJ = 0
+            let aluminumMassKg =
+                aluminumDensityKgM3 * cellVolumeM3
+
+            let aluminumHeatCapacityJPerK =
+                aluminumMassKg * aluminumSpecificHeat
+
+            let ambientHeatJ =
+                aluminumHeatCapacityJPerK * ambientTemperatureC
+            
+            lattice[index].heatJ = ambientHeatJ
             lattice[index].flow = 0
             lattice[index].pressurePa = 0
 
@@ -1678,6 +1687,7 @@ final class RadiatorCAEngine: ObservableObject {
 
         for index in cells.indices {
             cells[index].temperatureC = ambientTemperatureC
+            
             cells[index].heatJ = 0
             cells[index].flowRateM3S = 0
             cells[index].pressurePa = 0
@@ -4842,4 +4852,3 @@ final class RadiatorCAEngine: ObservableObject {
             bestMetrics
     }
 }
-
