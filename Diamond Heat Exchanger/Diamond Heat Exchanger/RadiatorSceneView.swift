@@ -1,3 +1,4 @@
+
 //
 //  RadiatorSceneView.swift
 //  Diamond Heat Exchanger
@@ -12,36 +13,31 @@ import UIKit
 /*
  Renders the lattice as small spheres, one per occupied cell.
 
- - Aluminum spheres have a diameter equal to the cell pitch, so every
-   face-connected pair of cells touches. A connected lattice therefore
-   looks connected, and a broken one shows its gap.
- - Water is drawn smaller so the channels stay readable inside the metal.
- - Plain air cells are hidden by default (showAir) because the whole
-   free volume is air and would bury the structure. Air ports are
-   always drawn.
+ Aluminum thermal state:
+ - cell.heatJ is the ONLY authoritative aluminum thermal state.
+ - Aluminum temperature is derived from heatJ only for visualization.
+ - Aluminum cell.temperatureC is never read.
 
- Nodes are created once and reused. Each update only swaps a shared
- geometry (state + temperature bucket) onto the node, instead of
- rebuilding thousands of nodes and materials every generation.
- */
+ Water thermal state:
+ - Water continues to use cell.temperatureC.
+
+ Nodes are created once and reused.
+ Each update selects shared geometry based on:
+ - cell state
+ - thermal bucket
+*/
 
 struct RadiatorSceneView: UIViewRepresentable {
 
     let cells: [RadiatorCell]
     let gridSize: Int
     let cellSize: Float
-
     var showAir: Bool = false
 
     // MARK: - Style Constants
-    //
-    // Kept in a nested enum (not private stored properties) so the
-    // memberwise initializer stays internal and ContentView can still
-    // call RadiatorSceneView(cells:gridSize:cellSize:).
 
     private enum Style {
 
-        /// Sphere diameter as a multiple of the cell pitch.
         static let aluminumDiameterScale: Float = 1.0
         static let waterDiameterScale: Float = 0.62
         static let waterPortDiameterScale: Float = 0.85
@@ -57,14 +53,19 @@ struct RadiatorSceneView: UIViewRepresentable {
     // MARK: - Coordinator
 
     private struct GeometryKey: Hashable {
+
         let state: RadiatorCellState
         let bucket: Int
     }
 
     final class Coordinator {
+
         let latticeNode = SCNNode()
+
         var nodesByCellID: [Int: SCNNode] = [:]
+
         var geometryCache: [AnyHashable: SCNGeometry] = [:]
+
         var lastShowAir = false
     }
 
@@ -79,12 +80,14 @@ struct RadiatorSceneView: UIViewRepresentable {
     ) -> SCNView {
 
         let view = SCNView()
+
         view.backgroundColor = .black
         view.allowsCameraControl = true
         view.autoenablesDefaultLighting = true
         view.antialiasingMode = .multisampling4X
 
         let scene = SCNScene()
+
         view.scene = scene
 
         scene.rootNode.addChildNode(
@@ -92,7 +95,9 @@ struct RadiatorSceneView: UIViewRepresentable {
         )
 
         let cameraNode = makeCameraNode()
+
         scene.rootNode.addChildNode(cameraNode)
+
         view.pointOfView = cameraNode
 
         synchronize(
@@ -128,13 +133,17 @@ struct RadiatorSceneView: UIViewRepresentable {
             guard shouldRender(currentCell.state)
             else {
 
-                coordinator.nodesByCellID[currentCell.id]?.isHidden = true
+                coordinator
+                    .nodesByCellID[currentCell.id]?
+                    .isHidden = true
+
                 continue
             }
 
             let node: SCNNode
 
-            if let existing = coordinator.nodesByCellID[currentCell.id] {
+            if let existing =
+                coordinator.nodesByCellID[currentCell.id] {
 
                 node = existing
 
@@ -150,6 +159,7 @@ struct RadiatorSceneView: UIViewRepresentable {
                     )
 
                 coordinator.latticeNode.addChildNode(node)
+
                 coordinator.nodesByCellID[currentCell.id] = node
             }
 
@@ -162,6 +172,7 @@ struct RadiatorSceneView: UIViewRepresentable {
                 )
 
             if node.geometry !== geometry {
+
                 node.geometry = geometry
             }
         }
@@ -195,12 +206,42 @@ struct RadiatorSceneView: UIViewRepresentable {
 
         switch currentCell.state {
 
-        case .aluminum,
-             .water,
+        // -------------------------------------------------
+        // ALUMINUM
+        // -------------------------------------------------
+
+        case .aluminum:
+
+            /*
+             IMPORTANT:
+
+             Aluminum does NOT use cell.temperatureC.
+
+             heatJ is converted to a derived temperature
+             solely for visualization.
+            */
+
+            bucket =
+                aluminumTemperatureBucket(
+                    heatJ: currentCell.heatJ
+                )
+
+        // -------------------------------------------------
+        // WATER
+        // -------------------------------------------------
+
+        case .water,
              .waterInlet,
              .waterOutlet:
 
-            bucket = temperatureBucket(currentCell.temperatureC)
+            bucket =
+                temperatureBucket(
+                    currentCell.temperatureC
+                )
+
+        // -------------------------------------------------
+        // AIR / PORTS
+        // -------------------------------------------------
 
         default:
 
@@ -213,30 +254,127 @@ struct RadiatorSceneView: UIViewRepresentable {
                 bucket: bucket
             )
 
-        if let cached = coordinator.geometryCache[key] {
+        if let cached =
+            coordinator.geometryCache[key] {
+
             return cached
         }
 
         let diameter =
-            CGFloat(cellSize * diameterScale(for: currentCell.state))
+            CGFloat(
+                cellSize *
+                diameterScale(
+                    for: currentCell.state
+                )
+            )
 
         let sphere =
             SCNSphere(
                 radius: diameter / 2.0
             )
 
-        sphere.segmentCount = segmentCount(for: currentCell.state)
+        sphere.segmentCount =
+            segmentCount(
+                for: currentCell.state
+            )
 
         sphere.firstMaterial =
             material(
                 for: currentCell.state,
-                temperatureC: temperature(forBucket: bucket)
+                temperatureC:
+                    temperature(
+                        forBucket: bucket
+                    )
             )
 
         coordinator.geometryCache[key] = sphere
 
         return sphere
     }
+
+    // MARK: - Aluminum Thermal Visualization
+
+    /*
+     Converts aluminum heatJ into temperature.
+
+     heatJ is the authoritative aluminum thermal state.
+
+     This function does NOT modify the cell.
+     It only derives a visualization temperature.
+    */
+
+    private func aluminumTemperatureC(
+        from heatJ: Double
+    ) -> Double {
+
+        let aluminumHeatJ =
+            max(
+                heatJ,
+                0.0
+            )
+
+        let aluminumMassKg =
+            aluminumDensityKgM3 *
+            cellVolumeM3
+
+        let heatCapacityJPerK =
+            aluminumMassKg *
+            aluminumSpecificHeat
+
+        guard heatCapacityJPerK > 0 else {
+            return Style.minimumTemperatureC
+        }
+
+        return
+            ambientTemperatureC +
+            aluminumHeatJ /
+            heatCapacityJPerK
+    }
+
+    private func aluminumTemperatureBucket(
+        heatJ: Double
+    ) -> Int {
+
+        let temperatureC =
+            aluminumTemperatureC(
+                from: heatJ
+            )
+
+        return temperatureBucket(
+            temperatureC
+        )
+    }
+
+    // MARK: - Thermal Constants
+
+    /*
+     These match the thermal model used by the
+     Diamond Heat Exchanger engine.
+
+     Aluminum temperature is derived from heatJ.
+    */
+
+    private let aluminumDensityKgM3 =
+        2700.0
+
+    private let aluminumSpecificHeat =
+        897.0
+
+    private let ambientTemperatureC =
+        25.0
+
+    private var cellVolumeM3: Double {
+
+        let size =
+            Double(cellSize)
+
+        return
+            size *
+            size *
+            size
+    }
+
+    // MARK: - Diameter
 
     private func diameterScale(
         for state: RadiatorCellState
@@ -252,6 +390,7 @@ struct RadiatorSceneView: UIViewRepresentable {
 
         case .waterInlet,
              .waterOutlet:
+
             return Style.waterPortDiameterScale
 
         case .air:
@@ -259,12 +398,15 @@ struct RadiatorSceneView: UIViewRepresentable {
 
         case .airInlet,
              .airOutlet:
+
             return Style.airPortDiameterScale
 
         case .empty:
             return 0.0
         }
     }
+
+    // MARK: - Segment Count
 
     private func segmentCount(
         for state: RadiatorCellState
@@ -280,10 +422,12 @@ struct RadiatorSceneView: UIViewRepresentable {
              .waterOutlet,
              .airInlet,
              .airOutlet:
+
             return 10
 
         case .air,
              .empty:
+
             return 6
         }
     }
@@ -299,14 +443,25 @@ struct RadiatorSceneView: UIViewRepresentable {
                 1.0,
                 max(
                     0.0,
-                    (temperatureC - Style.minimumTemperatureC) /
-                    (Style.maximumTemperatureC - Style.minimumTemperatureC)
+                    (
+                        temperatureC -
+                        Style.minimumTemperatureC
+                    ) /
+                    (
+                        Style.maximumTemperatureC -
+                        Style.minimumTemperatureC
+                    )
                 )
             )
 
         return Int(
-            (normalized * Double(Style.temperatureBuckets - 1))
-                .rounded()
+            (
+                normalized *
+                Double(
+                    Style.temperatureBuckets - 1
+                )
+            )
+            .rounded()
         )
     }
 
@@ -315,9 +470,14 @@ struct RadiatorSceneView: UIViewRepresentable {
     ) -> Double {
 
         Style.minimumTemperatureC +
-        (Style.maximumTemperatureC - Style.minimumTemperatureC) *
+        (
+            Style.maximumTemperatureC -
+            Style.minimumTemperatureC
+        ) *
         Double(bucket) /
-        Double(Style.temperatureBuckets - 1)
+        Double(
+            Style.temperatureBuckets - 1
+        )
     }
 
     // MARK: - Thermal Material
@@ -328,6 +488,7 @@ struct RadiatorSceneView: UIViewRepresentable {
     ) -> SCNMaterial {
 
         let material = SCNMaterial()
+
         material.lightingModel = .blinn
 
         switch state {
@@ -456,22 +617,15 @@ struct RadiatorSceneView: UIViewRepresentable {
                 )
             )
 
-        // Thermal progression:
-        //
-        // 25°C   → blue
-        // 40°C   → cyan
-        // 60°C   → green
-        // 75°C   → yellow
-        // 95°C   → orange
-        // 120°C  → red
+        let stops:
+            [(Double, CGFloat, CGFloat, CGFloat)] = [
 
-        let stops: [(Double, CGFloat, CGFloat, CGFloat)] = [
-            (0.00, 0.05, 0.15, 1.00), // blue
-            (0.20, 0.00, 0.85, 1.00), // cyan
-            (0.40, 0.00, 1.00, 0.25), // green
-            (0.60, 1.00, 1.00, 0.00), // yellow
-            (0.80, 1.00, 0.35, 0.00), // orange
-            (1.00, 1.00, 0.00, 0.00)  // red
+            (0.00, 0.05, 0.15, 1.00),
+            (0.20, 0.00, 0.85, 1.00),
+            (0.40, 0.00, 1.00, 0.25),
+            (0.60, 1.00, 1.00, 0.00),
+            (0.80, 1.00, 0.35, 0.00),
+            (1.00, 1.00, 0.00, 0.00)
         ]
 
         for index in 0..<(stops.count - 1) {
@@ -524,12 +678,15 @@ struct RadiatorSceneView: UIViewRepresentable {
     private func makeCameraNode() -> SCNNode {
 
         let camera = SCNCamera()
+
         camera.fieldOfView = 52
         camera.zNear = 0.001
         camera.zFar = 100
 
         let cameraNode = SCNNode()
+
         cameraNode.name = "mainCamera"
+
         cameraNode.camera = camera
 
         cameraNode.position =
