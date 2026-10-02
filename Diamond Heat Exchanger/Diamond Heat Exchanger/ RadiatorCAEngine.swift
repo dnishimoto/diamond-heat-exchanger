@@ -642,101 +642,413 @@ final class RadiatorCAEngine: ObservableObject {
         }
     }
     // MARK: - Ports
+    private func carveManifoldPath(
+        from start: GridPoint,
+        to target: GridPoint,
+        state: RadiatorCellState
+    ) {
 
-    private func createPorts() {
+        guard isValid(start),
+              isValid(target)
+        else {
+            return
+        }
 
-        waterPorts = [
+        var queue: [GridPoint] = [start]
+        var queueIndex = 0
 
-            FlowPort(
-                point: GridPoint(
-                    x: 0,
-                    y: 5,
-                    z: 5
-                ),
-                kind: .waterInlet
-            ),
+        var cameFrom: [GridPoint: GridPoint] = [:]
+        var visited = Set<GridPoint>()
 
-            FlowPort(
-                point: GridPoint(
-                    x: 0,
-                    y: gridSize - 6,
-                    z: gridSize - 6
-                ),
-                kind: .waterInlet
-            ),
+        visited.insert(start)
 
-            FlowPort(
-                point: GridPoint(
-                    x: gridSize - 1,
-                    y: 5,
-                    z: gridSize - 6
-                ),
-                kind: .waterOutlet
-            ),
+        while queueIndex < queue.count {
 
-            FlowPort(
-                point: GridPoint(
-                    x: gridSize - 1,
-                    y: gridSize - 6,
-                    z: 5
-                ),
-                kind: .waterOutlet
-            )
-        ]
+            let current = queue[queueIndex]
+            queueIndex += 1
 
-        airPorts = [
+            if current == target {
+                break
+            }
 
-            FlowPort(
-                point: GridPoint(
-                    x: 5,
-                    y: 0,
-                    z: 5
-                ),
-                kind: .airInlet
-            ),
+            let neighbors = neighborPoints(current)
+                .sorted {
+                    channelTraversalCost(
+                        $0,
+                        target: target,
+                        state: state
+                    )
+                    <
+                    channelTraversalCost(
+                        $1,
+                        target: target,
+                        state: state
+                    )
+                }
 
-            FlowPort(
-                point: GridPoint(
-                    x: gridSize - 6,
-                    y: 0,
-                    z: gridSize - 6
-                ),
-                kind: .airInlet
-            ),
+            for neighbor in neighbors {
 
-            FlowPort(
-                point: GridPoint(
-                    x: 5,
-                    y: gridSize - 1,
-                    z: gridSize - 6
-                ),
-                kind: .airOutlet
-            ),
+                guard isValid(neighbor) else {
+                    continue
+                }
 
-            FlowPort(
-                point: GridPoint(
-                    x: gridSize - 6,
-                    y: gridSize - 1,
-                    z: 5
-                ),
-                kind: .airOutlet
-            )
-        ]
+                guard !visited.contains(neighbor) else {
+                    continue
+                }
+
+                // Never allow water to occupy air ports
+                // or air to occupy water ports.
+                let neighborIndex = indexFor(neighbor)
+
+                guard let index = neighborIndex else {
+                    continue
+                }
+
+                let existingState = cells[index].state
+
+                if state == .water &&
+                    (existingState == .air ||
+                     existingState == .airInlet ||
+                     existingState == .airOutlet) {
+                    continue
+                }
+
+                if state == .air &&
+                    (existingState == .water ||
+                     existingState == .waterInlet ||
+                     existingState == .waterOutlet) {
+                    continue
+                }
+
+                visited.insert(neighbor)
+                cameFrom[neighbor] = current
+                queue.append(neighbor)
+            }
+        }
+
+        guard visited.contains(target) else {
+            return
+        }
+
+        // Reconstruct path.
+        var path: [GridPoint] = []
+        var current = target
+
+        path.append(current)
+
+        while current != start {
+
+            guard let previous = cameFrom[current] else {
+                return
+            }
+
+            current = previous
+            path.append(current)
+        }
+
+        // Carve the path.
+        for point in path {
+
+            guard let index = indexFor(point) else {
+                continue
+            }
+
+            guard point.z > 0 else {
+                continue
+            }
+
+            switch state {
+            case .water:
+                cells[index].state = .water
+
+            case .air:
+                cells[index].state = .air
+
+            default:
+                break
+            }
+        }
     }
+ 
+    private func channelTraversalCost(
+        _ point: GridPoint,
+        target: GridPoint,
+        state: RadiatorCellState
+    ) -> Int {
 
-    // MARK: - Flow Network Construction
+        guard let index = indexFor(point) else {
+            return Int.max
+        }
 
+        let cellState = cells[index].state
+
+        let distance = manhattanDistance(
+            point,
+            target
+        )
+
+        // Existing fluid channels are cheapest.
+        if state == .water &&
+            (cellState == .water ||
+             cellState == .waterInlet ||
+             cellState == .waterOutlet) {
+            return distance
+        }
+
+        if state == .air &&
+            (cellState == .air ||
+             cellState == .airInlet ||
+             cellState == .airOutlet) {
+            return distance
+        }
+
+        // Empty space is preferred over cutting aluminum.
+        if cellState == .empty {
+            return distance + 1
+        }
+
+        // Aluminum can still be carved when necessary,
+        // but it is strongly penalized.
+        if cellState == .aluminum {
+            return distance + 20
+        }
+
+        return Int.max / 2
+    }
+    private func createPorts() {
+        waterPorts.removeAll()
+        airPorts.removeAll()
+
+        let last = gridSize - 1
+
+        // Distributed across each face.
+        // z = 0 remains reserved for the aluminum build platform.
+        let positions = [3, 7, 10, 13, 17]
+
+        // MARK: Water
+        //
+        // Water enters through x = 0
+        // and exits through x = last.
+        //
+        // 25 water inlets
+        // 25 water outlets
+
+        for y in positions {
+            for z in positions {
+
+                guard z > 0 else {
+                    continue
+                }
+
+                waterPorts.append(
+                    FlowPort(
+                        point: GridPoint(
+                            x: 0,
+                            y: y,
+                            z: z
+                        ),
+                        kind: .waterInlet
+                    )
+                )
+
+                waterPorts.append(
+                    FlowPort(
+                        point: GridPoint(
+                            x: last,
+                            y: y,
+                            z: z
+                        ),
+                        kind: .waterOutlet
+                    )
+                )
+            }
+        }
+
+        // MARK: Air
+        //
+        // Air enters through y = 0
+        // and exits through y = last.
+        //
+        // 25 air inlets
+        // 25 air outlets
+
+        for x in positions {
+            for z in positions {
+
+                guard z > 0 else {
+                    continue
+                }
+
+                airPorts.append(
+                    FlowPort(
+                        point: GridPoint(
+                            x: x,
+                            y: 0,
+                            z: z
+                        ),
+                        kind: .airInlet
+                    )
+                )
+
+                airPorts.append(
+                    FlowPort(
+                        point: GridPoint(
+                            x: x,
+                            y: last,
+                            z: z
+                        ),
+                        kind: .airOutlet
+                    )
+                )
+            }
+        }
+
+        print("""
+        PORT DISTRIBUTION
+        -----------------
+        Water inlets:  \(waterPorts.filter { $0.kind == .waterInlet }.count)
+        Water outlets: \(waterPorts.filter { $0.kind == .waterOutlet }.count)
+        Air inlets:    \(airPorts.filter { $0.kind == .airInlet }.count)
+        Air outlets:   \(airPorts.filter { $0.kind == .airOutlet }.count)
+        Total ports:   \(waterPorts.count + airPorts.count)
+        """)
+    }
     private func carveFlowNetworks() {
-
-        carveWaterNetwork()
-
-        carveAirNetwork()
+        carveDistributedWaterNetwork()
+        carveDistributedAirNetwork()
 
         removeFlowOverlap()
-
         applyPortStates()
     }
 
+    private func carveDistributedWaterNetwork() {
+
+        let waterInlets = waterPorts.filter {
+            $0.kind == .waterInlet
+        }
+
+        let waterOutlets = waterPorts.filter {
+            $0.kind == .waterOutlet
+        }
+
+        guard !waterInlets.isEmpty,
+              !waterOutlets.isEmpty
+        else {
+            return
+        }
+
+        // Keep unused outlets in a Set so each outlet is
+        // assigned only once.
+        var unusedOutlets = Set(
+            waterOutlets.map { $0.point }
+        )
+
+        // Match each inlet to the nearest available outlet.
+        // This creates distributed parallel water channels.
+        for inlet in waterInlets {
+
+            guard !unusedOutlets.isEmpty else {
+                break
+            }
+
+            guard let outlet = nearestPoint(
+                to: inlet.point,
+                from: Array(unusedOutlets)
+            ) else {
+                continue
+            }
+
+            carveManifoldPath(
+                from: inlet.point,
+                to: outlet,
+                state: .water
+            )
+
+            unusedOutlets.remove(outlet)
+        }
+
+        // If there are more inlets than outlets, allow the
+        // remaining inlets to share their nearest outlet.
+        if !unusedOutlets.isEmpty == false,
+           waterInlets.count > waterOutlets.count {
+
+            let allOutletPoints = waterOutlets.map {
+                $0.point
+            }
+
+            for inlet in waterInlets.dropFirst(waterOutlets.count) {
+
+                guard let outlet = nearestPoint(
+                    to: inlet.point,
+                    from: allOutletPoints
+                ) else {
+                    continue
+                }
+
+                carveManifoldPath(
+                    from: inlet.point,
+                    to: outlet,
+                    state: .water
+                )
+            }
+        }
+    }
+ 
+    private func manhattanDistance(
+        _ a: GridPoint,
+        _ b: GridPoint
+    ) -> Int {
+
+        abs(a.x - b.x)
+        + abs(a.y - b.y)
+        + abs(a.z - b.z)
+    }
+    private func nearestPoint(
+        to source: GridPoint,
+        from candidates: [GridPoint]
+    ) -> GridPoint? {
+
+        candidates.min {
+            manhattanDistance(source, $0)
+            <
+            manhattanDistance(source, $1)
+        }
+    }
+    private func carveDistributedAirNetwork() {
+
+        let airInlets = airPorts.filter {
+            $0.kind == .airInlet
+        }
+
+        let airOutlets = airPorts.filter {
+            $0.kind == .airOutlet
+        }
+        guard !airInlets.isEmpty,
+              !airOutlets.isEmpty
+        else {
+            return
+        }
+
+        let outletPoints = airOutlets.map {
+            $0.point
+        }
+
+        for inlet in airInlets {
+
+            guard let outlet = nearestPoint(
+                to: inlet.point,
+                from: outletPoints
+            ) else {
+                continue
+            }
+
+            carveManifoldPath(
+                from: inlet.point,
+                to: outlet,
+                state: .air
+            )
+        }
+    }
     private func carveWaterNetwork() {
 
         let inlets =
@@ -787,97 +1099,7 @@ final class RadiatorCAEngine: ObservableObject {
         }
     }
 
-    private func carveManifoldPath(
-        from start: GridPoint,
-        to target: GridPoint,
-        state: RadiatorCellState
-    ) {
-        guard isValid(start),
-              isValid(target)
-        else {
-            return
-        }
-
-        let startIndex = indexFor(start)!
-        let targetIndex = indexFor(target)!
-
-        var queue: [GridPoint] = [start]
-        var visited = Set<GridPoint>()
-        var previous: [GridPoint: GridPoint] = [:]
-
-        visited.insert(start)
-
-        while !queue.isEmpty {
-            let current = queue.removeFirst()
-
-            if current == target {
-                break
-            }
-
-            let neighbors = neighborPoints(current)
-
-            for next in neighbors {
-                guard isValid(next),
-                      !visited.contains(next),
-                      let nextIndex = indexFor(next)
-                else {
-                    continue
-                }
-
-                let nextState = cells[nextIndex].state
-
-                // Water cannot occupy an air channel.
-                if state == .water && nextState.isAir {
-                    continue
-                }
-
-                // Air cannot occupy a water channel.
-                if state == .air && nextState.isWater {
-                    continue
-                }
-
-                visited.insert(next)
-                previous[next] = current
-                queue.append(next)
-            }
-        }
-
-        guard visited.contains(target) else {
-            return
-        }
-
-        // Reconstruct path.
-        var path: [GridPoint] = []
-        var current = target
-
-        path.append(current)
-
-        while current != start {
-            guard let parent = previous[current] else {
-                return
-            }
-
-            current = parent
-            path.append(current)
-        }
-
-        // Carve the complete path.
-        for point in path {
-            guard let index = indexFor(point) else {
-                continue
-            }
-
-            cells[index].state = state
-        }
-
-        // Explicitly restore the target.
-        if let targetIndex = indexFor(target) {
-            cells[targetIndex].state = state
-        }
-
-        _ = startIndex
-        _ = targetIndex
-    }
+    
 
     private func removeFlowOverlap() {
 
