@@ -15,6 +15,27 @@ import Foundation
 @MainActor
 final class RadiatorCAEngine: ObservableObject {
     
+    private var cellVolumeM3: Double {
+        cellSizeM * cellSizeM * cellSizeM
+    }
+
+    private var aluminumCellMassKg: Double {
+        aluminumDensityKgM3 * cellVolumeM3
+    }
+
+    private var waterCellMassKg: Double {
+        waterDensityKgM3 * cellVolumeM3
+    }
+
+    private var airCellMassKg: Double {
+        airDensityKgM3 * cellVolumeM3
+    }
+    
+    private let ambientTemperatureC = 25.0
+    private let airInletTemperatureC = 25.0
+    private let waterInletTemperatureC = 35.0
+    
+    
     private let waterHeatTransferCoefficient = 3_500_000.0
 
     private let airHeatTransferCoefficient = 75_000.0
@@ -57,9 +78,6 @@ final class RadiatorCAEngine: ObservableObject {
 
     private let cellSizeM = 0.002
 
-    private var cellVolumeM3: Double {
-        cellSizeM * cellSizeM * cellSizeM
-    }
 
     private var cellFaceAreaM2: Double {
         cellSizeM * cellSizeM
@@ -95,10 +113,6 @@ final class RadiatorCAEngine: ObservableObject {
     }
 
     // MARK: - Ambient Conditions
-
-    private let ambientTemperatureC = 25.0
-
-    private let airInletTemperatureC = 25.0
 
     private let maximumAllowedTemperatureC = 120.0
 
@@ -417,8 +431,55 @@ final class RadiatorCAEngine: ObservableObject {
 
         generation = 0
     }
+    private func referenceTemperatureC(
+        for cell: RadiatorCell
+    ) -> Double {
+        switch cell.state {
+        case .water, .waterInlet, .waterOutlet:
+            return waterInletTemperatureC
 
-    // MARK: - Gap-Free Lattice Helpers
+        case .air, .airInlet, .airOutlet:
+            return airInletTemperatureC
+
+        case .aluminum:
+            return ambientTemperatureC
+
+        default:
+            return ambientTemperatureC
+        }
+    }
+    private func thermalCapacityJPerK(
+        for cell: RadiatorCell
+    ) -> Double {
+        switch cell.state {
+        case .aluminum:
+            return aluminumCellMassKg * aluminumSpecificHeat
+
+        case .water, .waterInlet, .waterOutlet:
+            return waterCellMassKg * waterSpecificHeat
+
+        case .air, .airInlet, .airOutlet:
+            return airCellMassKg * airSpecificHeat
+
+        default:
+            return 0.0
+        }
+    }
+
+    private func temperatureFromHeat(
+        heatJ: Double,
+        massKg: Double,
+        specificHeatJPerKgK: Double,
+        referenceTemperatureC: Double
+    ) -> Double {
+        let heatCapacityJPerK = massKg * specificHeatJPerKgK
+
+        guard heatCapacityJPerK > 1e-12 else {
+            return referenceTemperatureC
+        }
+
+        return referenceTemperatureC + heatJ / heatCapacityJPerK
+    }
 
     private func buildNeighborTable() -> [Int] {
 
@@ -2827,10 +2888,52 @@ final class RadiatorCAEngine: ObservableObject {
             =============================================================
             """
         )
+    
+            airEnergyRemovedThisStepJ = airEnergyExportedThisStepJ
+            airEnergyRemovedJ += airEnergyExportedThisStepJ
 
-        printThermalEnergyBudget()
+            // Commit the completed thermal step.
+            cells = nextCells
+
+            let stored = calculateStoredEnergyByMaterial(in: cells)
+
+            let storedEnergyJ = stored.totalJ
+
+            printThermalEnergyBudget(storedEnergyJ: storedEnergyJ)
+
+            thermalSimulationTimeS += thermalTimeStepS
     }
- 
+    private func calculateStoredEnergyByMaterial(
+        in lattice: [RadiatorCell]
+    ) -> (
+        waterJ: Double,
+        aluminumJ: Double,
+        airJ: Double,
+        totalJ: Double
+    ) {
+        var waterJ = 0.0
+        var aluminumJ = 0.0
+        var airJ = 0.0
+
+        for cell in lattice {
+            let energyJ = max(0.0, cell.heatJ)
+
+            if cell.state.isWater {
+                waterJ += energyJ
+            } else if cell.state == .aluminum {
+                aluminumJ += energyJ
+            } else if cell.state.isAir {
+                airJ += energyJ
+            }
+        }
+
+        return (
+            waterJ: waterJ,
+            aluminumJ: aluminumJ,
+            airJ: airJ,
+            totalJ: waterJ + aluminumJ + airJ
+        )
+    }
     private var datacenterWaterInletTemperatureC: Double {
 
         /*
@@ -2850,79 +2953,34 @@ final class RadiatorCAEngine: ObservableObject {
     }
 
     
-    private func printThermalEnergyBudget() {
+    private func thermalStoredEnergyJ(in lattice: [RadiatorCell]) -> Double {
+        lattice.reduce(0.0) { partial, cell in
+            partial + max(0.0, cell.heatJ)
+        }
+    }
 
-        let aluminumHeatJ =
-            cells.reduce(0.0) { total, cell in
+    private func printThermalEnergyBudget(
+        storedEnergyJ: Double
+    ) {
+        let accountedEnergyJ = storedEnergyJ + airEnergyRemovedJ
+        let errorJ = datacenterEnergyInjectedJ - accountedEnergyJ
 
-                guard cell.state == .aluminum
-                else {
-                    return total
-                }
+        let relativeErrorPercent: Double
+        if datacenterEnergyInjectedJ > 1e-9 {
+            relativeErrorPercent =
+                100.0 * errorJ / datacenterEnergyInjectedJ
+        } else {
+            relativeErrorPercent = 0.0
+        }
 
-                return total +
-                    max(cell.heatJ, 0.0)
-            }
-
-        let waterHeatJ =
-            cells.reduce(0.0) { total, cell in
-
-                guard cell.state.isWater
-                else {
-                    return total
-                }
-
-                return total +
-                    max(cell.heatJ, 0.0)
-            }
-
-        let airHeatJ =
-            cells.reduce(0.0) { total, cell in
-
-                guard cell.state.isAir
-                else {
-                    return total
-                }
-
-                return total +
-                    max(cell.heatJ, 0.0)
-            }
-
-        print(
-            """
-            THERMAL ENERGY DISTRIBUTION
-
-            Datacenter injected:
-            \(datacenterEnergyInjectedJ) J
-
-            Water thermal energy:
-            \(waterHeatJ) J
-
-            Actual water → aluminum transfer:
-            \(waterToAluminumEnergyJ) J
-
-            Aluminum lattice thermal energy:
-            \(aluminumHeatJ) J
-
-            Aluminum → air transfer:
-            \(aluminumToAirEnergyJ) J
-
-            Air removed:
-            \(airEnergyRemovedJ) J
-
-            STATUS
-
-            Actual water → aluminum transfer:
-            \(waterToAluminumEnergyJ > 0
-                ? "PASS"
-                : "NOT SHOWN / NO TRANSFER RECORDED")
-
-            Aluminum lattice contains injected heat:
-            \(aluminumHeatJ > 0
-                ? "PASS"
-                : "NOT PROVEN")
-            """
-        )
+        print("""
+        ENERGY BUDGET
+        Injected:  \(datacenterEnergyInjectedJ) J
+        Stored:    \(storedEnergyJ) J
+        Air out:   \(airEnergyRemovedJ) J
+        Accounted: \(accountedEnergyJ) J
+        Error:     \(errorJ) J (\(relativeErrorPercent)%)
+        """)
     }
     private func resetThermalEnergyAccounting() {
 
@@ -4107,20 +4165,13 @@ final class RadiatorCAEngine: ObservableObject {
     // MARK: - Energy / Heat Rejection
 
     private func calculateHeatRejectedW() -> Double {
+        guard thermalSimulationTimeS > 1e-12 else { return 0.0 }
+        return airEnergyRemovedJ / thermalSimulationTimeS
+    }
 
-        guard thermalSimulationTimeS > 0 else {
-            return 0.0
-        }
-
-        /*
-         Heat actually delivered to the air.
-
-         This is cumulative energy transferred from the
-         aluminum into the air divided by simulation time.
-         */
-
-        return airEnergyRemovedJ /
-            thermalSimulationTimeS
+    private var instantaneousHeatRejectedW: Double {
+        guard thermalTimeStepS > 1e-12 else { return 0.0 }
+        return airEnergyRemovedThisStepJ / thermalTimeStepS
     }
     private func transferWaterToAluminum() {
 

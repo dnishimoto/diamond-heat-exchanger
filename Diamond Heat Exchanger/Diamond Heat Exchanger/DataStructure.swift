@@ -38,6 +38,7 @@ enum RadiatorCellState: String, CaseIterable, Identifiable {
         self == .airOutlet
     }
 
+    
     var isSolid: Bool {
         self == .aluminum
     }
