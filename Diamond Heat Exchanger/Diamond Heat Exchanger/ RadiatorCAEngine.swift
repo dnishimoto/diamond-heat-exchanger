@@ -1,5 +1,5 @@
 //
-//  File2.swift
+//  RadiatorCAEngine.swift
 //  Diamond Heat Exchanger
 //
 //  Created by David Nishimoto on 10/1/26.
@@ -14,6 +14,7 @@ import Foundation
 
 @MainActor
 final class RadiatorCAEngine: ObservableObject {
+    private let maximumAluminumFraction = 0.60
     
     @Published private(set) var datacenterEnergyInjectedJ: Double = 0
     @Published private(set) var waterToAluminumEnergyJ: Double = 0
@@ -144,6 +145,31 @@ final class RadiatorCAEngine: ObservableObject {
     // MARK: - Thermal Accounting
 
      private var waterEnergyExportedJ = 0.0
+
+    // MARK: - Lattice Growth Rules
+
+    /*
+     Upper bound on aluminum as a fraction of the whole grid.
+     Growth stops here so the lattice stays porous enough for air.
+     Left alone, the growth rule saturates on its own at roughly 46%.
+     */
+
+
+    /*
+     true for every cell that belonged to a carved air channel
+     (including inlet/outlet ports) when the geometry was built.
+     These cells guarantee an inlet-to-outlet air path and are
+     never converted to aluminum by the CA.
+     */
+
+    private var airChannelMask: [Bool] = []
+
+    /*
+     Flat face-neighbor table: 6 entries per cell
+     (+x, -x, +y, -y, +z, -z), -1 when outside the grid.
+     */
+
+    private lazy var neighborTable: [Int] = buildNeighborTable()
 
 
 
@@ -397,7 +423,348 @@ final class RadiatorCAEngine: ObservableObject {
 
         applyPortStates()
 
+        finalizeInitialLattice()
+
         generation = 0
+    }
+
+    // MARK: - Gap-Free Lattice Helpers
+
+    private func buildNeighborTable() -> [Int] {
+
+        var table = [Int](
+            repeating: -1,
+            count: totalCells * 6
+        )
+
+        let offsets: [(Int, Int, Int)] = [
+            (1, 0, 0),
+            (-1, 0, 0),
+            (0, 1, 0),
+            (0, -1, 0),
+            (0, 0, 1),
+            (0, 0, -1)
+        ]
+
+        for z in 0..<gridSize {
+            for y in 0..<gridSize {
+                for x in 0..<gridSize {
+
+                    let index = linearIndex(x: x, y: y, z: z)
+
+                    for (slot, offset) in offsets.enumerated() {
+
+                        let nx = x + offset.0
+                        let ny = y + offset.1
+                        let nz = z + offset.2
+
+                        guard nx >= 0, nx < gridSize,
+                              ny >= 0, ny < gridSize,
+                              nz >= 0, nz < gridSize
+                        else {
+                            continue
+                        }
+
+                        table[index * 6 + slot] =
+                            linearIndex(x: nx, y: ny, z: nz)
+                    }
+                }
+            }
+        }
+
+        return table
+    }
+
+    /*
+     Called once after the seed and flow channels are carved.
+
+     1. Remember the carved air channels.
+     2. Drop aluminum that is not connected to the platform.
+        It becomes AIR, not an empty void.
+     3. Fill every remaining void with air.
+
+     After this there are no .empty cells. Every cell is
+     aluminum, water, or air.
+     */
+
+    private func finalizeInitialLattice() {
+
+        airChannelMask = cells.map {
+            $0.state.isAir
+        }
+
+        removeDisconnectedAluminumCells(
+            from: &cells
+        )
+
+        fillVoidsWithAir(
+            in: &cells
+        )
+    }
+
+    private func fillVoidsWithAir(
+        in lattice: inout [RadiatorCell]
+    ) {
+
+        for index in lattice.indices {
+
+            guard lattice[index].state == .empty
+            else {
+                continue
+            }
+
+            lattice[index].state = .air
+            lattice[index].temperatureC = airInletTemperatureC
+            lattice[index].heatJ = 0.0
+        }
+    }
+
+    private func neighborCounts(
+        of index: Int,
+        in lattice: [RadiatorCell]
+    ) -> (aluminum: Int, air: Int, water: Int) {
+
+        var aluminum = 0
+        var air = 0
+        var water = 0
+
+        let base = index * 6
+
+        for slot in 0..<6 {
+
+            let neighborIndex = neighborTable[base + slot]
+
+            guard neighborIndex >= 0
+            else {
+                continue
+            }
+
+            let state = lattice[neighborIndex].state
+
+            if state == .aluminum {
+                aluminum += 1
+            } else if state.isAir {
+                air += 1
+            } else if state.isWater {
+                water += 1
+            }
+        }
+
+        return (aluminum, air, water)
+    }
+
+    private func meanAluminumNeighborTemperature(
+        of index: Int,
+        in lattice: [RadiatorCell]
+    ) -> Double {
+
+        var sum = 0.0
+        var count = 0
+
+        let base = index * 6
+
+        for slot in 0..<6 {
+
+            let neighborIndex = neighborTable[base + slot]
+
+            guard neighborIndex >= 0,
+                  lattice[neighborIndex].state == .aluminum
+            else {
+                continue
+            }
+
+            sum += lattice[neighborIndex].temperatureC
+            count += 1
+        }
+
+        return count > 0
+            ? sum / Double(count)
+            : ambientTemperatureC
+    }
+
+    /*
+     Turning `index` into aluminum must not leave any neighboring
+     free-air cell with fewer than two air neighbors. That would
+     create a dead-end pocket with no through-flow.
+
+     Carved channel cells are skipped because they stay connected
+     to each other regardless.
+     */
+
+    private func keepsAirPocketsOpen(
+        at index: Int,
+        in lattice: [RadiatorCell]
+    ) -> Bool {
+
+        let base = index * 6
+
+        for slot in 0..<6 {
+
+            let neighborIndex = neighborTable[base + slot]
+
+            guard neighborIndex >= 0,
+                  lattice[neighborIndex].state == .air,
+                  !airChannelMask[neighborIndex]
+            else {
+                continue
+            }
+
+            var remainingAir = 0
+
+            let neighborBase = neighborIndex * 6
+
+            for innerSlot in 0..<6 {
+
+                let candidate = neighborTable[neighborBase + innerSlot]
+
+                guard candidate >= 0,
+                      candidate != index
+                else {
+                    continue
+                }
+
+                if lattice[candidate].state.isAir {
+                    remainingAir += 1
+                }
+            }
+
+            if remainingAir < 2 {
+                return false
+            }
+        }
+
+        return true
+    }
+
+    /*
+     Safety net. Any air region that cannot be reached from an
+     air inlet is a trapped void. If it touches aluminum, fill it
+     with aluminum so the structure has no hidden gaps.
+
+     Ports are never overwritten.
+     */
+
+    private func sealDeadAirPockets(
+        in lattice: inout [RadiatorCell]
+    ) {
+
+        let total = lattice.count
+
+        var reached = [Bool](
+            repeating: false,
+            count: total
+        )
+
+        var queue: [Int] = []
+        queue.reserveCapacity(total)
+
+        for port in airPorts where port.kind == .airInlet {
+
+            guard let index = indexFor(port.point),
+                  !reached[index]
+            else {
+                continue
+            }
+
+            reached[index] = true
+            queue.append(index)
+        }
+
+        var head = 0
+
+        while head < queue.count {
+
+            let current = queue[head]
+            head += 1
+
+            for slot in 0..<6 {
+
+                let neighborIndex = neighborTable[current * 6 + slot]
+
+                guard neighborIndex >= 0,
+                      !reached[neighborIndex],
+                      lattice[neighborIndex].state.isAir
+                else {
+                    continue
+                }
+
+                reached[neighborIndex] = true
+                queue.append(neighborIndex)
+            }
+        }
+
+        var seen = [Bool](
+            repeating: false,
+            count: total
+        )
+
+        for start in 0..<total {
+
+            guard lattice[start].state.isAir,
+                  !reached[start],
+                  !seen[start]
+            else {
+                continue
+            }
+
+            var component: [Int] = [start]
+            seen[start] = true
+
+            var componentHead = 0
+            var touchesAluminum = false
+
+            while componentHead < component.count {
+
+                let current = component[componentHead]
+                componentHead += 1
+
+                for slot in 0..<6 {
+
+                    let neighborIndex = neighborTable[current * 6 + slot]
+
+                    guard neighborIndex >= 0
+                    else {
+                        continue
+                    }
+
+                    if lattice[neighborIndex].state == .aluminum {
+                        touchesAluminum = true
+                        continue
+                    }
+
+                    guard lattice[neighborIndex].state.isAir,
+                          !reached[neighborIndex],
+                          !seen[neighborIndex]
+                    else {
+                        continue
+                    }
+
+                    seen[neighborIndex] = true
+                    component.append(neighborIndex)
+                }
+            }
+
+            guard touchesAluminum
+            else {
+                continue
+            }
+
+            for index in component where lattice[index].state == .air {
+
+                lattice[index].temperatureC =
+                    meanAluminumNeighborTemperature(
+                        of: index,
+                        in: lattice
+                    )
+
+                lattice[index].state = .aluminum
+
+                synchronizeCellHeat(
+                    index: index,
+                    cells: &lattice
+                )
+            }
+        }
     }
 
     private func injectDatacenterHeat() {
@@ -424,6 +791,8 @@ final class RadiatorCAEngine: ObservableObject {
 
         datacenterEnergyInjectedJ += injectedEnergyJ
     }
+
+    @discardableResult
     private func removeDisconnectedAluminumCells(
         from lattice: inout [RadiatorCell]
     ) -> Int {
@@ -431,6 +800,7 @@ final class RadiatorCAEngine: ObservableObject {
         // MARK: 1. Find aluminum touching the build platform
 
         let platformCells: [GridPoint] = lattice.indices.compactMap { index in
+
             let point = pointFor(index)
 
             guard point.z == 0,
@@ -442,28 +812,38 @@ final class RadiatorCAEngine: ObservableObject {
             return point
         }
 
-        // No platform-connected aluminum exists.
+        // No aluminum touches the build platform.
+        // Do not delete anything here because there is no valid
+        // platform reference from which to classify cells as floating.
         guard !platformCells.isEmpty else {
+
             print("STRUCTURE: No aluminum touches z=0 platform")
+
             return 0
         }
 
-        // MARK: 2. Flood-fill through FACE-CONNECTED aluminum only
+        // MARK: 2. Flood-fill through the diamond lattice
 
+        // A diamond lattice can connect through faces, edges, and
+        // corners. Therefore use the same 26-neighbor definition
+        // used by printableCandidate().
         var connected = Set<GridPoint>()
+
         var queue: [GridPoint] = platformCells
-        var queueIndex = 0
+        queue.reserveCapacity(lattice.count)
 
         for point in platformCells {
             connected.insert(point)
         }
+
+        var queueIndex = 0
 
         while queueIndex < queue.count {
 
             let current = queue[queueIndex]
             queueIndex += 1
 
-            for neighbor in neighborPoints(current) {
+            for neighbor in allNeighborPoints(current) {
 
                 guard isValid(neighbor) else {
                     continue
@@ -477,6 +857,8 @@ final class RadiatorCAEngine: ObservableObject {
                     continue
                 }
 
+                // Only aluminum participates in the structural
+                // connectivity test.
                 guard lattice[neighborIndex].state == .aluminum else {
                     continue
                 }
@@ -486,7 +868,7 @@ final class RadiatorCAEngine: ObservableObject {
             }
         }
 
-        // MARK: 3. Remove disconnected aluminum
+        // MARK: 3. Remove only truly floating aluminum
 
         var aluminumCount = 0
         var removedCount = 0
@@ -501,11 +883,14 @@ final class RadiatorCAEngine: ObservableObject {
 
             let point = pointFor(index)
 
+            // Connected to the build platform through the diamond
+            // structure -> KEEP.
             guard !connected.contains(point) else {
                 continue
             }
 
-            lattice[index].state = .empty
+            // No structural path to the build platform -> FLOATING.
+            lattice[index].state = .air
             lattice[index].temperatureC = ambientTemperatureC
             lattice[index].heatJ = 0
             lattice[index].flow = 0
@@ -514,17 +899,63 @@ final class RadiatorCAEngine: ObservableObject {
             removedCount += 1
         }
 
-        print("""
-        STRUCTURE CLEANUP:
-          Platform aluminum: \(platformCells.count)
-          Connected aluminum: \(connected.count)
-          Aluminum before cleanup: \(aluminumCount)
-          Disconnected removed: \(removedCount)
-          Aluminum remaining: \(aluminumCount - removedCount)
-        """)
+        // MARK: 4. Diagnostics
+
+        if removedCount > 0 {
+
+            print("""
+            STRUCTURE CLEANUP:
+
+              Platform aluminum: \(platformCells.count)
+              Structurally connected: \(connected.count)
+              Aluminum before cleanup: \(aluminumCount)
+              Floating aluminum removed: \(removedCount)
+              Aluminum remaining: \(aluminumCount - removedCount)
+            """)
+        } else {
+
+            print("""
+            STRUCTURE CLEANUP:
+
+              Platform aluminum: \(platformCells.count)
+              Structurally connected: \(connected.count)
+              Aluminum before cleanup: \(aluminumCount)
+              Floating aluminum removed: 0
+              Aluminum remaining: \(aluminumCount)
+            """)
+        }
 
         return removedCount
     }
+    private func allNeighborPoints(_ point: GridPoint) -> [GridPoint] {
+
+        var neighbors: [GridPoint] = []
+        neighbors.reserveCapacity(26)
+
+        for dz in -1...1 {
+            for dy in -1...1 {
+                for dx in -1...1 {
+
+                    // Skip the cell itself.
+                    if dx == 0 && dy == 0 && dz == 0 {
+                        continue
+                    }
+
+                    neighbors.append(
+                        GridPoint(
+                            x: point.x + dx,
+                            y: point.y + dy,
+                            z: point.z + dz
+                        )
+                    )
+                }
+            }
+        }
+
+        return neighbors
+    }
+   
+
     private func seedDiamondGeometry() {
         let center = Double(gridSize - 1) / 2.0
 
@@ -2090,125 +2521,226 @@ final class RadiatorCAEngine: ObservableObject {
         }
     }
 
-    // MARK: - CA Step
-
     private func stepCAInternal() {
-        let previousGeneration = generation
-        let previousCells = cells
-        var candidateCells = previousCells
-        let nextGeneration = previousGeneration + 1
 
-        for index in previousCells.indices {
-            let currentCell = previousCells[index]
+        let nextGeneration = generation + 1
+        var candidateCells = cells
 
-            // Ports are fixed and are never modified by the CA.
-            guard !currentCell.state.isPort else {
-                continue
+        let lastInterior = gridSize - 2
+        let aluminumCap =
+            Int(Double(totalCells) * maximumAluminumFraction)
+
+        var aluminumCount = candidateCells.reduce(into: 0) {
+            count, cell in
+
+            if cell.state == .aluminum {
+                count += 1
             }
+        }
 
-            // Only aluminum and empty cells participate
-            // in geometry evolution. Fluid channels remain intact.
-            guard currentCell.state == .empty ||
-                  currentCell.state == .aluminum
-            else {
-                continue
-            }
+        let parity = nextGeneration % 2
 
-            let point = pointFor(index)
-            let neighbors = neighborPoints(point)
+        // MARK: - Diagnostics
 
-            var aluminumNeighbors = 0
-            var waterNeighbors = 0
-            var airNeighbors = 0
+        var growthCandidates = 0
+        var acceptedGrowth = 0
+        var rejectedAirPocket = 0
+        var rejectedPort = 0
 
-            for neighborPoint in neighbors {
-                guard let neighborIndex = indexFor(neighborPoint)
-                else {
-                    continue
-                }
+        // MARK: - CA growth
 
-                let neighbor = previousCells[neighborIndex]
+        for z in 1...lastInterior {
+            for y in 1...lastInterior {
+                for x in 1...lastInterior {
 
-                if neighbor.state == .aluminum {
-                    aluminumNeighbors += 1
-                }
+                    // Preserve checkerboard growth.
+                    guard (x + y + z) % 2 == parity else {
+                        continue
+                    }
 
-                if neighbor.state.isWater {
-                    waterNeighbors += 1
-                }
+                    guard aluminumCount < aluminumCap else {
+                        break
+                    }
 
-                if neighbor.state.isAir {
-                    airNeighbors += 1
-                }
-            }
+                    let index = linearIndex(
+                        x: x,
+                        y: y,
+                        z: z
+                    )
 
-            let fluidInterface =
-                waterNeighbors > 0 ||
-                airNeighbors > 0
+                    let point = GridPoint(
+                        x: x,
+                        y: y,
+                        z: z
+                    )
 
-            let structuralSupport =
-                Double(aluminumNeighbors) / 6.0
+                    // Only grow into empty cells.
+                    guard candidateCells[index].state == .air else {
+                        continue
+                    }
 
-            let diamondPhase =
-                (
-                    currentCell.x +
-                    currentCell.y +
-                    currentCell.z +
-                    nextGeneration
-                ) % 4
+                    // -------------------------------------------------
+                    // Protect actual transport ports.
+                    // -------------------------------------------------
 
-            let diamondCandidate =
-                diamondPhase == 0 ||
-                diamondPhase == 3
+                    let isWaterPort = waterPorts.contains {
+                        $0.point == point
+                    }
 
-            // Grow aluminum where the CA pattern,
-            // structural support, and fluid interface agree.
-            if currentCell.state == .empty &&
-                diamondCandidate &&
-                structuralSupport >= 0.20 &&
-                fluidInterface {
+                    let isAirPort = airPorts.contains {
+                        $0.point == point
+                    }
 
-                candidateCells[index].state = .aluminum
+                    guard !isWaterPort && !isAirPort else {
+                        rejectedPort += 1
+                        continue
+                    }
 
-            } else if currentCell.state == .aluminum {
+                    growthCandidates += 1
 
-                let isolated =
-                    aluminumNeighbors == 0
+                    // -------------------------------------------------
+                    // Neighbor information
+                    // -------------------------------------------------
 
-                let buried =
-                    waterNeighbors == 0 &&
-                    airNeighbors == 0 &&
-                    aluminumNeighbors >= 5
+                    let counts = neighborCounts(
+                        of: index,
+                        in: candidateCells
+                    )
 
-                if isolated || buried {
-                    candidateCells[index].state = .empty
+                    let hasAluminumSupport =
+                        counts.aluminum > 0
+
+                    let hasWaterInterface =
+                        counts.water > 0
+
+                    let hasAirExposure =
+                        counts.air > 0
+
+                    let exposureGain =
+                        counts.air - counts.aluminum
+
+                    // -------------------------------------------------
+                    // Normal structural / thermal score
+                    // -------------------------------------------------
+
+                    var structuralScore = 0
+
+                    if hasAluminumSupport {
+                        structuralScore += 2
+                    }
+
+                    if hasWaterInterface {
+                        structuralScore += 2
+                    }
+
+                    if hasAirExposure {
+                        structuralScore += 1
+                    }
+
+                    if exposureGain >= 0 {
+                        structuralScore += 1
+                    }
+
+                    // -------------------------------------------------
+                    // Explicit volumetric eligibility.
+                    //
+                    // Interior cells do not need to already touch
+                    // aluminum, water, or air.
+                    // -------------------------------------------------
+
+                    let isInteriorVolume =
+                        x > 1 &&
+                        x < lastInterior &&
+                        y > 1 &&
+                        y < lastInterior &&
+                        z > 1 &&
+                        z < lastInterior
+
+                    let structurallyUseful =
+                        hasAluminumSupport ||
+                        hasWaterInterface ||
+                        hasAirExposure ||
+                        isInteriorVolume
+
+                    guard structurallyUseful else {
+                        continue
+                    }
+
+                    // -------------------------------------------------
+                    // Preserve required air/water passages.
+                    // -------------------------------------------------
+
+                    guard keepsAirPocketsOpen(
+                        at: index,
+                        in: candidateCells
+                    ) else {
+                        rejectedAirPocket += 1
+                        continue
+                    }
+
+                    // -------------------------------------------------
+                    // Deposit aluminum.
+                    // -------------------------------------------------
+
+                    candidateCells[index].temperatureC =
+                        meanAluminumNeighborTemperature(
+                            of: index,
+                            in: candidateCells
+                        )
+
+                    candidateCells[index].state = .aluminum
+
+                    synchronizeCellHeat(
+                        index: index,
+                        cells: &candidateCells
+                    )
+
+                    aluminumCount += 1
+                    acceptedGrowth += 1
                 }
             }
         }
 
-        // Ports remain explicitly defined.
-        applyPortStates(
-            to: &candidateCells
-        )
-        
-        removeDisconnectedAluminumCells(
-            from: &candidateCells
-        )
+        // Restore port states.
+        applyPortStates(to: &candidateCells)
 
+        // -------------------------------------------------------------
+        // IMPORTANT:
+        //
+        // No aluminum pruning or air cleanup occurs here.
+        // Validate the complete candidate first.
+        // -------------------------------------------------------------
 
-        // Structural validation is ONLY aluminum-to-platform
-        // connectivity. Air, water, channels, and voids are ignored.
-        guard printableCandidate(candidateCells)
-        else {
+        guard printableCandidate(candidateCells) else {
+
+            print("""
+            CA GENERATION \(nextGeneration) REJECTED
+            reason: printableCandidate
+
+            aluminum: \(aluminumCount)/\(aluminumCap)
+            growthCandidates: \(growthCandidates)
+            acceptedGrowth: \(acceptedGrowth)
+            rejectedPorts: \(rejectedPort)
+            rejectedAirPockets: \(rejectedAirPocket)
+            """)
+
             return
         }
 
-        // Fluid-network validation remains separate from
-        // printable aluminum connectivity.
         guard verifyNetworkConnectivity(
             kind: .waterInlet,
             cells: candidateCells
         ) else {
+
+            print("""
+            CA GENERATION \(nextGeneration) REJECTED
+            reason: water connectivity
+
+            aluminum: \(aluminumCount)/\(aluminumCap)
+            growthCandidates: \(growthCandidates)
+            acceptedGrowth: \(acceptedGrowth)
+            """)
+
             return
         }
 
@@ -2216,8 +2748,22 @@ final class RadiatorCAEngine: ObservableObject {
             kind: .airOutlet,
             cells: candidateCells
         ) else {
+
+            print("""
+            CA GENERATION \(nextGeneration) REJECTED
+            reason: air connectivity
+
+            aluminum: \(aluminumCount)/\(aluminumCap)
+            growthCandidates: \(growthCandidates)
+            acceptedGrowth: \(acceptedGrowth)
+            """)
+
             return
         }
+
+        // -------------------------------------------------------------
+        // COMMIT
+        // -------------------------------------------------------------
 
         cells = candidateCells
         generation = nextGeneration
@@ -2226,10 +2772,39 @@ final class RadiatorCAEngine: ObservableObject {
             cells[index].generation = generation
         }
 
+        // -------------------------------------------------------------
+        // Cleanup ONLY after successful validation/commit.
+        // -------------------------------------------------------------
+
+        sealDeadAirPockets(
+            in: &cells
+        )
+
+        fillVoidsWithAir(
+            in: &cells
+        )
+
+        applyPortStates(
+            to: &cells
+        )
+
+        // -------------------------------------------------------------
+        // Continue simulation.
+        // -------------------------------------------------------------
+
         advanceThermalField()
         evaluateSimulation()
-    }
 
+        print("""
+        CA GENERATION \(generation) COMMITTED
+
+        aluminum: \(aluminumCount)/\(aluminumCap)
+        growthCandidates: \(growthCandidates)
+        acceptedGrowth: \(acceptedGrowth)
+        rejectedPorts: \(rejectedPort)
+        rejectedAirPockets: \(rejectedAirPocket)
+        """)
+    }
     // MARK: - Public CA Step
 
     func stepCA() {
@@ -2300,64 +2875,109 @@ final class RadiatorCAEngine: ObservableObject {
             return false
         }
 
-        for inlet in inlets {
+        // The carved networks are PARALLEL channels, so requiring every
+        // inlet to reach every outlet can never hold: that made every
+        // CA step get rejected and froze the lattice at generation 0.
+        //
+        // The correct rule: label the connected fluid regions, then
+        //   - every inlet's region must contain at least one outlet
+        //   - every outlet's region must contain at least one inlet
 
-            guard let inletIndex = indexFor(inlet.point)
+        let total = candidateCells.count
+
+        var regionOf = [Int](
+            repeating: -1,
+            count: total
+        )
+
+        var regionCount = 0
+
+        var queue: [Int] = []
+        queue.reserveCapacity(total)
+
+        for port in inlets + outlets {
+
+            guard let start = indexFor(port.point)
             else {
                 return false
             }
 
-            var visited = Set<Int>()
+            guard isFluid(candidateCells[start].state)
+            else {
+                return false
+            }
 
-            var queue: [Int] = [
-                inletIndex
-            ]
+            guard regionOf[start] < 0
+            else {
+                continue
+            }
 
-            visited.insert(inletIndex)
+            let region = regionCount
+            regionCount += 1
 
-            while !queue.isEmpty {
+            regionOf[start] = region
 
-                let currentIndex = queue.removeFirst()
+            queue.removeAll(keepingCapacity: true)
+            queue.append(start)
 
-                let point = pointFor(currentIndex)
+            var head = 0
+ 
+            while head < queue.count {
 
-                for neighborPoint in neighborPoints(point) {
+                let current = queue[head]
+                head += 1
 
-                    guard let neighborIndex =
-                        indexFor(neighborPoint)
+                for slot in 0..<6 {
+
+                    let neighborIndex = neighborTable[current * 6 + slot]
+
+                    guard neighborIndex >= 0,
+                          regionOf[neighborIndex] < 0,
+                          isFluid(candidateCells[neighborIndex].state)
                     else {
                         continue
                     }
 
-                    guard !visited.contains(neighborIndex)
-                    else {
-                        continue
-                    }
-
-                    guard isFluid(
-                        candidateCells[neighborIndex].state
-                    )
-                    else {
-                        continue
-                    }
-
-                    visited.insert(neighborIndex)
-
+                    regionOf[neighborIndex] = region
                     queue.append(neighborIndex)
                 }
             }
+        }
 
-            for outlet in outlets {
+        var regionHasInlet = [Bool](
+            repeating: false,
+            count: regionCount
+        )
 
-                guard let outletIndex =
-                    indexFor(outlet.point)
-                else {
-                    return false
-                }
+        var regionHasOutlet = [Bool](
+            repeating: false,
+            count: regionCount
+        )
 
-                if !visited.contains(outletIndex) {
-                    return false
-                }
+        for port in inlets {
+
+            guard let index = indexFor(port.point)
+            else {
+                return false
+            }
+
+            regionHasInlet[regionOf[index]] = true
+        }
+
+        for port in outlets {
+
+            guard let index = indexFor(port.point)
+            else {
+                return false
+            }
+
+            regionHasOutlet[regionOf[index]] = true
+        }
+
+        for region in 0..<regionCount {
+
+            if regionHasInlet[region] != regionHasOutlet[region] {
+                return false
             }
         }
 
@@ -2369,9 +2989,12 @@ final class RadiatorCAEngine: ObservableObject {
         _ candidate: [RadiatorCell]
     ) -> Bool {
 
-        // Find every aluminum cell touching the build platform.
+        // ------------------------------------------------------------
+        // 1. Collect aluminum touching the build platform.
+        // ------------------------------------------------------------
         let platformAluminum: [GridPoint] =
             candidate.indices.compactMap { index in
+
                 let cell = candidate[index]
 
                 guard cell.state == .aluminum,
@@ -2387,29 +3010,32 @@ final class RadiatorCAEngine: ObservableObject {
                 )
             }
 
-        // The candidate must actually touch the build platform.
+        // A printable part must have at least one aluminum contact
+        // with the build platform.
         guard !platformAluminum.isEmpty else {
             return false
         }
 
-        // Flood fill uses GridPoint directly.
+        // ------------------------------------------------------------
+        // 2. Flood-fill aluminum from the build platform.
+        // ------------------------------------------------------------
         var visited = Set<GridPoint>()
+
         var queue = platformAluminum
 
         for point in platformAluminum {
             visited.insert(point)
         }
 
-        var queueIndex = 0
+        var head = 0
 
-        while queueIndex < queue.count {
-            let point = queue[queueIndex]
-            queueIndex += 1
+        while head < queue.count {
+
+            let point = queue[head]
+            head += 1
 
             for neighbor in neighborPoints(point) {
 
-                // Only aluminum participates in structural
-                // connectivity.
                 guard let neighborIndex = indexFor(neighbor),
                       candidate[neighborIndex].state == .aluminum
                 else {
@@ -2422,58 +3048,98 @@ final class RadiatorCAEngine: ObservableObject {
             }
         }
 
-        // Count every aluminum cell in the candidate.
-        let aluminumCount =
-            candidate.reduce(into: 0) { count, cell in
-                if cell.state == .aluminum {
-                    count += 1
-                }
+        // ------------------------------------------------------------
+        // 3. Count all aluminum.
+        // ------------------------------------------------------------
+        let totalAluminum = candidate.reduce(
+            into: 0
+        ) { count, cell in
+
+            if cell.state == .aluminum {
+                count += 1
             }
+        }
 
-        // Every aluminum cell must connect back to z == 0.
-        return visited.count == aluminumCount
+        guard totalAluminum > 0 else {
+            return false
+        }
+
+        // ------------------------------------------------------------
+        // 4. All structural aluminum must be build-connected.
+        // ------------------------------------------------------------
+        //
+        // This remains intentionally strict because this is the
+        // manufacturing validator.
+        //
+        // It is NOT used to control CA growth.
+        //
+        guard visited.count == totalAluminum else {
+            return false
+        }
+
+        // ------------------------------------------------------------
+        // 5. Require the aluminum structure to occupy the 3D volume.
+        // ------------------------------------------------------------
+        let aluminumCells = candidate.filter {
+            $0.state == .aluminum
+        }
+
+        guard !aluminumCells.isEmpty else {
+            return false
+        }
+
+        let minX = aluminumCells.map(\.x).min()!
+        let maxX = aluminumCells.map(\.x).max()!
+
+        let minY = aluminumCells.map(\.y).min()!
+        let maxY = aluminumCells.map(\.y).max()!
+
+        let minZ = aluminumCells.map(\.z).min()!
+        let maxZ = aluminumCells.map(\.z).max()!
+
+        // The candidate must actually occupy all three dimensions.
+        guard maxX > minX,
+              maxY > minY,
+              maxZ > minZ
+        else {
+            return false
+        }
+
+        return true
     }
-
     // MARK: - Surface Area
 
     private func calculateSurfaceArea(
         _ currentCells: [RadiatorCell]
     ) -> Double {
 
-        var area = 0.0
+        // Aluminum faces that touch AIR. Water-wetted faces are
+        // not counted: this is the area that dumps heat to the air.
+
+        var exposedFaces = 0
 
         for index in currentCells.indices {
 
-            guard currentCells[index].state ==
-                    .aluminum
+            guard currentCells[index].state == .aluminum
             else {
                 continue
             }
 
-            let point =
-                pointFor(index)
+            let base = index * 6
 
-            for neighborPoint in
-                neighborPoints(point) {
+            for slot in 0..<6 {
 
-                guard let neighborIndex =
-                    indexFor(neighborPoint)
-                else {
-                    continue
-                }
+                let neighborIndex = neighborTable[base + slot]
 
-                let neighbor =
-                    currentCells[neighborIndex]
+                if neighborIndex >= 0,
+                   currentCells[neighborIndex].state.isAir {
 
-                if neighbor.state.isWater ||
-                   neighbor.state.isAir {
-
-                    area += cellFaceAreaM2
+                    exposedFaces += 1
                 }
             }
         }
 
-        return area
+        return Double(exposedFaces) * cellFaceAreaM2
     }
 
     // MARK: - Flow
@@ -2517,15 +3183,27 @@ final class RadiatorCAEngine: ObservableObject {
         _ currentCells: [RadiatorCell]
     ) -> Double {
 
-        let airCells =
-            currentCells.reduce(
-                into: 0
-            ) { count, cell in
+        // Count only the carved air channels. The ambient air that
+        // now fills the rest of the volume is not ducted flow, so it
+        // must not inflate the flow, pressure, and fan-power numbers.
 
-                if cell.state.isAir {
-                    count += 1
-                }
+        var airCells = 0
+
+        for index in currentCells.indices {
+
+            guard currentCells[index].state.isAir
+            else {
+                continue
             }
+
+            if airChannelMask.count == currentCells.count,
+               !airChannelMask[index] {
+
+                continue
+            }
+
+            airCells += 1
+        }
 
         guard airCells > 0 else {
             return 0.0
@@ -3068,11 +3746,19 @@ final class RadiatorCAEngine: ObservableObject {
                 heatToPower / 100.0
             )
 
+        // Air-exposed faces as a share of the grid. The old term
+        // saturated almost immediately, so it could not rank designs.
+
+        let exposedFaces =
+            m.aluminumSurfaceAreaM2 /
+            cellFaceAreaM2
+
         let surfaceScore =
             min(
-                50.0,
-                m.aluminumSurfaceAreaM2 *
-                10_000.0
+                100.0,
+                100.0 *
+                exposedFaces /
+                Double(totalCells)
             )
 
         return
@@ -3125,3 +3811,4 @@ final class RadiatorCAEngine: ObservableObject {
             bestMetrics
     }
 }
+
