@@ -16,6 +16,10 @@ import Foundation
 final class RadiatorCAEngine: ObservableObject {
     private let maximumAluminumFraction = 0.60
     
+    private let thermalTimeStepS = 0.02
+    private let datacenterHeatLoadJ = 1_000_000_000.0
+    private let targetRemovalTimeS = 60.0
+    
     @Published private(set) var datacenterEnergyInjectedJ: Double = 0
     @Published private(set) var waterToAluminumEnergyJ: Double = 0
     @Published private(set) var airEnergyRemovedJ: Double = 0
@@ -78,10 +82,7 @@ final class RadiatorCAEngine: ObservableObject {
      The target is to remove that energy in 60 seconds.
      */
 
-    private let datacenterHeatLoadJ = 1_000_000_000.0
-
-    private let targetRemovalTimeS = 60.0
-
+  
     private var requiredHeatRateW: Double {
         datacenterHeatLoadJ / targetRemovalTimeS
     }
@@ -102,20 +103,7 @@ final class RadiatorCAEngine: ObservableObject {
 
     // MARK: - Thermal Simulation
 
-    /*
-     Reduced-order thermal timestep.
-
-     This is a CA thermal timestep rather than a CFD timestep.
-     */
-
-    private let thermalTimeStepS = 0.02
-
-    /*
-     Water/aluminum and aluminum/air interface coefficients.
-
-     These are effective reduced-order coefficients used by the CA.
-     */
-
+  
     private let waterHeatTransferCoefficient = 3500.0
 
     private let airHeatTransferCoefficient = 75.0
@@ -249,9 +237,7 @@ final class RadiatorCAEngine: ObservableObject {
 
         evaluateSimulation()
     }
-
-    // MARK: - Indexing
-
+ 
     private func linearIndex(
         x: Int,
         y: Int,
@@ -1682,72 +1668,221 @@ final class RadiatorCAEngine: ObservableObject {
     private func applyWaterInletTemperature(
         to cells: inout [RadiatorCell]
     ) {
+        let remainingSourceEnergyJ =
+            max(
+                datacenterHeatLoadJ -
+                datacenterEnergyInjectedJ,
+                0.0
+            )
 
-        let waterFlowM3S = calculateWaterFlow(cells)
-        
+        guard remainingSourceEnergyJ > 0 else {
+            return
+        }
+
+        let timestepEnergyJ =
+            min(
+                requiredHeatRateW * thermalTimeStepS,
+                remainingSourceEnergyJ
+            )
+
+        guard timestepEnergyJ > 0 else {
+            return
+        }
+
+        let inletPorts = waterPorts.filter {
+            $0.kind == .waterInlet
+        }
+
+        guard !inletPorts.isEmpty else {
+            print(
+                "FAIL: No water inlet ports available."
+            )
+            return
+        }
+
+        let waterFlowM3S =
+            max(
+                calculateWaterFlow(cells),
+                0.0
+            )
+
         let massFlowKgS =
             max(
                 waterFlowM3S * waterDensityKgM3,
                 0.000001
             )
 
+        let waterMassThisStepKg =
+            massFlowKgS * thermalTimeStepS
+
+        guard waterMassThisStepKg > 0 else {
+            return
+        }
+
         let temperatureRiseC =
-            requiredHeatRateW /
-            (
-                massFlowKgS *
-                waterSpecificHeat
+            timestepEnergyJ /
+            max(
+                waterMassThisStepKg *
+                waterSpecificHeat,
+                1.0e-12
             )
 
         let inletTemperatureC =
             ambientTemperatureC +
             temperatureRiseC
 
-        for port in waterPorts
-        where port.kind == .waterInlet {
+        let energyPerInletJ =
+            timestepEnergyJ /
+            Double(inletPorts.count)
 
-            guard let index = indexFor(port.point)
+        for port in inletPorts {
+
+            guard let index =
+                    indexFor(port.point)
             else {
                 continue
             }
 
+            guard cells[index].state.isWater
+            else {
+                continue
+            }
+
+            cells[index].heatJ +=
+                energyPerInletJ
+
             cells[index].temperatureC =
                 inletTemperatureC
         }
-        
+
+        datacenterEnergyInjectedJ +=
+            timestepEnergyJ
+
+        datacenterEnergyInjectedJ =
+            min(
+                datacenterEnergyInjectedJ,
+                datacenterHeatLoadJ
+            )
+
         print(
-            "Water inlet:",
-            inletTemperatureC,
-            "°C | flow:",
-            waterFlowM3S,
-            "m³/s"
+            """
+            DATACENTER HEAT INJECTION
+
+            injected this step: \(timestepEnergyJ) J
+
+            total injected: \(datacenterEnergyInjectedJ) J
+
+            remaining:
+            \(datacenterHeatLoadJ -
+              datacenterEnergyInjectedJ) J
+
+            inlet temperature:
+            \(inletTemperatureC) °C
+
+            water flow:
+            \(waterFlowM3S) m³/s
+
+            mass flow:
+            \(massFlowKgS) kg/s
+            """
         )
     }
-    private var datacenterWaterInletTemperatureC: Double {
+    private func restoreWaterChannelWalls(
+        in cells: inout [RadiatorCell]
+    ) {
+        var repairedWallCount = 0
+        var skippedWaterPathCount = 0
+        var skippedOutOfBoundsCount = 0
 
-        /*
-         Limit only the numerical visualization.
+        for index in cells.indices {
 
-         The underlying 1 GJ energy accounting remains unchanged.
-         */
+            let waterCell =
+                cells[index]
 
-        let temperature =
-            ambientTemperatureC +
-            datacenterWaterTemperatureRiseC
+            guard waterCell.state == .water ||
+                  waterCell.state == .waterInlet ||
+                  waterCell.state == .waterOutlet
+            else {
+                continue
+            }
 
-        return min(
-            temperature,
-            250.0
+            let waterPoint =
+                pointFor(index)
+
+            for neighborPoint in neighborPoints(waterPoint) {
+
+                guard let neighborIndex =
+                        indexFor(neighborPoint)
+                else {
+                    skippedOutOfBoundsCount += 1
+                    continue
+                }
+
+                let neighborState =
+                    cells[neighborIndex].state
+
+                // Preserve the continuous water path and water ports.
+                guard neighborState != .water &&
+                      neighborState != .waterInlet &&
+                      neighborState != .waterOutlet
+                else {
+                    skippedWaterPathCount += 1
+                    continue
+                }
+
+                // Replace air or another non-water state with a
+                // solid aluminum coolant-channel wall.
+                guard neighborState != .aluminum
+                else {
+                    continue
+                }
+
+                cells[neighborIndex].state =
+                    .aluminum
+
+                cells[neighborIndex].temperatureC =
+                    ambientTemperatureC
+
+                cells[neighborIndex].heatJ =
+                    0.0
+
+                repairedWallCount += 1
+            }
+        }
+
+        print(
+            """
+            WATER CHANNEL WALL REPAIR
+
+            Aluminum wall cells restored:
+            \(repairedWallCount)
+
+            Preserved water-path neighbors:
+            \(skippedWaterPathCount)
+
+            Out-of-bounds neighbors:
+            \(skippedOutOfBoundsCount)
+            """
         )
     }
-
-    // MARK: - Thermal CA
-
     private func advanceThermalField() {
 
+        restoreWaterChannelWalls(
+               in: &cells
+           )
+        
         let previousCells = cells
         var nextCells = previousCells
 
         thermalSimulationTimeS += thermalTimeStepS
+
+        // -------------------------------------------------------------
+        // STEP ENERGY TARGET
+        // -------------------------------------------------------------
+
+        let requiredStepEnergyJ =
+            requiredHeatRateW *
+            thermalTimeStepS
 
         // -------------------------------------------------------------
         // 1. DATACENTER → WATER
@@ -1761,136 +1896,486 @@ final class RadiatorCAEngine: ObservableObject {
         // 2. WATER → ALUMINUM
         // -------------------------------------------------------------
 
-        for index in previousCells.indices {
+        var waterToAluminumThisStepJ = 0.0
 
-            let current = previousCells[index]
+        let remainingInjectedEnergyJ =
+            max(
+                datacenterEnergyInjectedJ -
+                waterToAluminumEnergyJ,
+                0.0
+            )
 
-            guard current.state == .water ||
-                  current.state == .waterInlet ||
-                  current.state == .waterOutlet
-            else {
-                continue
-            }
+        let targetWaterToAluminumStepJ =
+            min(
+                requiredStepEnergyJ,
+                remainingInjectedEnergyJ
+            )
 
-            let point = pointFor(index)
+        // -------------------------------------------------------------
+        // WATER → ALUMINUM DEBUG COUNTERS
+        // -------------------------------------------------------------
 
-            let waterTemperature =
-                current.temperatureC
+        var scannedCellCount = 0
 
-            for neighborPoint in neighborPoints(point) {
+        var waterCellCount = 0
+        var waterInletCellCount = 0
+        var waterOutletCellCount = 0
 
-                guard let neighborIndex =
-                    indexFor(neighborPoint)
+        var coldWaterCellCount = 0
+        var waterWithNoStoredEnergyCount = 0
+        var waterWithNoCapacityCount = 0
+
+        var neighborCheckCount = 0
+        var missingNeighborIndexCount = 0
+
+        var waterNeighborCount = 0
+        var airNeighborCount = 0
+        var aluminumNeighborCount = 0
+        var otherNeighborStateCount = 0
+
+        var positiveDeltaTCount = 0
+        var nonPositiveDeltaTCount = 0
+        var positiveInterfaceTransferCount = 0
+
+        var noAluminumCapacityCount = 0
+        var zeroTransferredEnergyCount = 0
+        var successfulTransferCount = 0
+
+        var firstWaterCellReported = false
+        var firstAluminumNeighborReported = false
+        var firstTransferReported = false
+
+        if targetWaterToAluminumStepJ > 0 {
+
+            for index in nextCells.indices {
+
+                scannedCellCount += 1
+
+                guard waterToAluminumThisStepJ <
+                        targetWaterToAluminumStepJ
+                else {
+                    break
+                }
+
+                let waterCell =
+                    nextCells[index]
+
+                guard waterCell.state == .water ||
+                      waterCell.state == .waterInlet ||
+                      waterCell.state == .waterOutlet
                 else {
                     continue
                 }
 
-                let neighbor =
-                    previousCells[neighborIndex]
+                switch waterCell.state {
 
-                guard neighbor.state == .aluminum
+                case .water:
+                    waterCellCount += 1
+
+                case .waterInlet:
+                    waterInletCellCount += 1
+
+                case .waterOutlet:
+                    waterOutletCellCount += 1
+
+                default:
+                    break
+                }
+
+                let waterTemperature =
+                    waterCell.temperatureC
+
+                let availableWaterEnergyJ =
+                    max(
+                        waterCell.heatJ,
+                        0.0
+                    )
+
+                if !firstWaterCellReported {
+
+                    firstWaterCellReported = true
+
+                    print(
+                        """
+                        WATER → ALUMINUM DEBUG: FIRST WATER CELL
+
+                        index:
+                        \(index)
+
+                        point:
+                        \(String(describing: pointFor(index)))
+
+                        state:
+                        \(String(describing: waterCell.state))
+
+                        temperature:
+                        \(waterTemperature) °C
+
+                        stored heat:
+                        \(availableWaterEnergyJ) J
+
+                        ambient:
+                        \(ambientTemperatureC) °C
+                        """
+                    )
+                }
+
+                guard waterTemperature >
+                        ambientTemperatureC
                 else {
+                    coldWaterCellCount += 1
                     continue
                 }
 
-                let deltaT =
-                    waterTemperature -
-                    neighbor.temperatureC
-
-                guard deltaT > 0
+                guard availableWaterEnergyJ > 0
                 else {
+                    waterWithNoStoredEnergyCount += 1
                     continue
                 }
 
-                let interfaceArea =
-                    cellFaceAreaM2
-
-                let idealTransfer =
-                    waterHeatTransferCoefficient *
-                    interfaceArea *
-                    deltaT *
-                    thermalTimeStepS
-
-                let waterMass =
+                let waterMassKg =
                     waterDensityKgM3 *
                     cellVolumeM3
 
-                let availableWaterEnergy =
-                    max(
-                        0.0,
-                        waterMass *
-                        waterSpecificHeat *
-                        max(
-                            waterTemperature -
-                            ambientTemperatureC,
-                            0.0
-                        )
-                    )
+                let waterHeatCapacity =
+                    waterMassKg *
+                    waterSpecificHeat
 
-                let transferred =
-                    min(
-                        idealTransfer,
-                        availableWaterEnergy
-                    )
-
-                guard transferred > 0
+                guard waterHeatCapacity > 0
                 else {
+                    waterWithNoCapacityCount += 1
                     continue
                 }
 
-                let waterDeltaT =
-                    transferred /
-                    max(
-                        waterMass *
-                        waterSpecificHeat,
-                        1.0e-12
-                    )
+                let point =
+                    pointFor(index)
 
-                let aluminumMass =
-                    aluminumDensityKgM3 *
-                    cellVolumeM3
+                for neighborPoint in neighborPoints(point) {
 
-                let aluminumDeltaT =
-                    transferred /
-                    max(
-                        aluminumMass *
-                        aluminumSpecificHeat,
-                        1.0e-12
-                    )
+                    guard waterToAluminumThisStepJ <
+                            targetWaterToAluminumStepJ
+                    else {
+                        break
+                    }
 
-                nextCells[index].temperatureC =
-                    max(
-                        ambientTemperatureC,
-                        nextCells[index].temperatureC -
-                        min(
-                            waterDeltaT,
-                            maximumTemperatureChangePerStepC
+                    neighborCheckCount += 1
+
+                    guard let neighborIndex =
+                            indexFor(neighborPoint)
+                    else {
+                        missingNeighborIndexCount += 1
+                        continue
+                    }
+
+                    let neighborCell =
+                        nextCells[neighborIndex]
+
+                    switch neighborCell.state {
+
+                    case .water,
+                         .waterInlet,
+                         .waterOutlet:
+
+                        waterNeighborCount += 1
+                        continue
+
+                    case .air:
+
+                        airNeighborCount += 1
+                        continue
+
+                    case .aluminum:
+
+                        aluminumNeighborCount += 1
+
+                    default:
+
+                        otherNeighborStateCount += 1
+                        continue
+                    }
+
+                    let aluminumTemperature =
+                        neighborCell.temperatureC
+
+                    if !firstAluminumNeighborReported {
+
+                        firstAluminumNeighborReported = true
+
+                        print(
+                            """
+                            WATER → ALUMINUM DEBUG: FIRST ALUMINUM NEIGHBOR
+
+                            water index:
+                            \(index)
+
+                            water point:
+                            \(String(describing: point))
+
+                            aluminum index:
+                            \(neighborIndex)
+
+                            aluminum point:
+                            \(String(describing: neighborPoint))
+
+                            water temperature:
+                            \(waterTemperature) °C
+
+                            aluminum temperature:
+                            \(aluminumTemperature) °C
+
+                            water stored heat:
+                            \(availableWaterEnergyJ) J
+                            """
                         )
-                    )
+                    }
 
-                nextCells[neighborIndex].temperatureC +=
-                    min(
-                        aluminumDeltaT,
-                        maximumTemperatureChangePerStepC
-                    )
+                    let deltaT =
+                        waterTemperature -
+                        aluminumTemperature
 
-                nextCells[index].heatJ =
-                    max(
-                        0.0,
-                        nextCells[index].heatJ -
-                        transferred
-                    )
+                    guard deltaT > 0
+                    else {
+                        nonPositiveDeltaTCount += 1
+                        continue
+                    }
 
-                nextCells[neighborIndex].heatJ +=
-                    transferred
+                    positiveDeltaTCount += 1
 
-                // -----------------------------------------------------
-                // CUMULATIVE ENERGY ACCOUNTING
-                // -----------------------------------------------------
+                    let interfaceTransferJ =
+                        waterHeatTransferCoefficient *
+                        cellFaceAreaM2 *
+                        deltaT *
+                        thermalTimeStepS
 
-                waterToAluminumEnergyJ += transferred
+                    guard interfaceTransferJ > 0
+                    else {
+                        continue
+                    }
+
+                    positiveInterfaceTransferCount += 1
+
+                    let remainingTargetJ =
+                        targetWaterToAluminumStepJ -
+                        waterToAluminumThisStepJ
+
+                    let aluminumMassKg =
+                        aluminumDensityKgM3 *
+                        cellVolumeM3
+
+                    let aluminumHeatCapacity =
+                        aluminumMassKg *
+                        aluminumSpecificHeat
+
+                    guard aluminumHeatCapacity > 0
+                    else {
+                        noAluminumCapacityCount += 1
+                        continue
+                    }
+
+                    let transferredJ =
+                        min(
+                            interfaceTransferJ,
+                            availableWaterEnergyJ,
+                            remainingTargetJ
+                        )
+
+                    guard transferredJ > 0
+                    else {
+                        zeroTransferredEnergyCount += 1
+                        continue
+                    }
+
+                    if !firstTransferReported {
+
+                        firstTransferReported = true
+
+                        print(
+                            """
+                            WATER → ALUMINUM DEBUG: FIRST TRANSFER
+
+                            water index:
+                            \(index)
+
+                            aluminum index:
+                            \(neighborIndex)
+
+                            delta T:
+                            \(deltaT) °C
+
+                            interface transfer:
+                            \(interfaceTransferJ) J
+
+                            available water energy:
+                            \(availableWaterEnergyJ) J
+
+                            target remaining:
+                            \(remainingTargetJ) J
+
+                            transferred:
+                            \(transferredJ) J
+                            """
+                        )
+                    }
+
+                    nextCells[index].heatJ =
+                        max(
+                            0.0,
+                            nextCells[index].heatJ -
+                            transferredJ
+                        )
+
+                    let waterDeltaT =
+                        transferredJ /
+                        waterHeatCapacity
+
+                    nextCells[index].temperatureC =
+                        max(
+                            ambientTemperatureC,
+                            nextCells[index].temperatureC -
+                            waterDeltaT
+                        )
+
+                    nextCells[neighborIndex].heatJ +=
+                        transferredJ
+
+                    let aluminumDeltaT =
+                        transferredJ /
+                        aluminumHeatCapacity
+
+                    nextCells[neighborIndex].temperatureC +=
+                        aluminumDeltaT
+
+                    waterToAluminumThisStepJ +=
+                        transferredJ
+
+                    waterToAluminumEnergyJ +=
+                        transferredJ
+
+                    successfulTransferCount += 1
+                }
             }
         }
+
+        // -------------------------------------------------------------
+        // WATER → ALUMINUM DIAGNOSTIC
+        // -------------------------------------------------------------
+
+        let waterTransferRateW =
+            waterToAluminumThisStepJ /
+            max(
+                thermalTimeStepS,
+                1.0e-12
+            )
+
+        let waterTransferEfficiency =
+            targetWaterToAluminumStepJ > 0
+            ? waterToAluminumThisStepJ /
+              targetWaterToAluminumStepJ
+            : 0.0
+
+        print(
+            """
+            =============================================================
+            WATER → ALUMINUM DEBUG SUMMARY
+            =============================================================
+
+            TARGET
+
+            target this step:
+            \(targetWaterToAluminumStepJ) J
+
+            actual this step:
+            \(waterToAluminumThisStepJ) J
+
+            cumulative transfer:
+            \(waterToAluminumEnergyJ) J
+
+            transfer rate:
+            \(waterTransferRateW) W
+
+            transfer efficiency:
+            \(waterTransferEfficiency)
+
+            -------------------------------------------------------------
+            WATER CELLS
+            -------------------------------------------------------------
+
+            cells scanned:
+            \(scannedCellCount)
+
+            ordinary water:
+            \(waterCellCount)
+
+            water inlets:
+            \(waterInletCellCount)
+
+            water outlets:
+            \(waterOutletCellCount)
+
+            skipped: cold water:
+            \(coldWaterCellCount)
+
+            skipped: no stored water energy:
+            \(waterWithNoStoredEnergyCount)
+
+            skipped: invalid water heat capacity:
+            \(waterWithNoCapacityCount)
+
+            -------------------------------------------------------------
+            NEIGHBORS OF HOT, ENERGIZED WATER
+            -------------------------------------------------------------
+
+            neighbor checks:
+            \(neighborCheckCount)
+
+            neighbor index missing:
+            \(missingNeighborIndexCount)
+
+            neighboring water:
+            \(waterNeighborCount)
+
+            neighboring air:
+            \(airNeighborCount)
+
+            neighboring aluminum:
+            \(aluminumNeighborCount)
+
+            neighboring other state:
+            \(otherNeighborStateCount)
+
+            -------------------------------------------------------------
+            INTERFACE TESTS
+            -------------------------------------------------------------
+
+            aluminum neighbors with positive ΔT:
+            \(positiveDeltaTCount)
+
+            aluminum neighbors with zero/negative ΔT:
+            \(nonPositiveDeltaTCount)
+
+            positive h × A × ΔT × dt:
+            \(positiveInterfaceTransferCount)
+
+            invalid aluminum heat capacity:
+            \(noAluminumCapacityCount)
+
+            zero final transferred energy:
+            \(zeroTransferredEnergyCount)
+
+            successful water → aluminum transfers:
+            \(successfulTransferCount)
+
+            -------------------------------------------------------------
+            STATUS
+            -------------------------------------------------------------
+
+            \(successfulTransferCount > 0
+                ? "PASS: Heat reached the aluminum lattice."
+                : "FAIL: No heat reached the aluminum lattice.")
+
+            =============================================================
+            """
+        )
 
         // -------------------------------------------------------------
         // 3. ALUMINUM ↔ ALUMINUM CONDUCTION
@@ -1898,22 +2383,23 @@ final class RadiatorCAEngine: ObservableObject {
 
         for index in previousCells.indices {
 
-            guard previousCells[index].state == .aluminum
+            guard previousCells[index].state ==
+                    .aluminum
             else {
                 continue
             }
 
-            let point = pointFor(index)
+            let point =
+                pointFor(index)
 
             for neighborPoint in neighborPoints(point) {
 
                 guard let neighborIndex =
-                    indexFor(neighborPoint)
+                        indexFor(neighborPoint)
                 else {
                     continue
                 }
 
-                // Process each aluminum pair once.
                 guard neighborIndex > index
                 else {
                     continue
@@ -1975,36 +2461,37 @@ final class RadiatorCAEngine: ObservableObject {
         // 4. ALUMINUM → AIR
         // -------------------------------------------------------------
 
+        var aluminumToAirThisStepJ = 0.0
+
         for index in previousCells.indices {
 
-            guard previousCells[index].state == .aluminum
+            guard previousCells[index].state ==
+                    .aluminum
             else {
                 continue
             }
 
-            let point = pointFor(index)
-
-            let aluminumTemperature =
-                previousCells[index].temperatureC
+            let point =
+                pointFor(index)
 
             for neighborPoint in neighborPoints(point) {
 
                 guard let neighborIndex =
-                    indexFor(neighborPoint)
+                        indexFor(neighborPoint)
                 else {
                     continue
                 }
 
-                let neighbor =
-                    previousCells[neighborIndex]
-
-                guard neighbor.state.isAir
+                guard previousCells[neighborIndex].state.isAir
                 else {
                     continue
                 }
+
+                let aluminumTemperature =
+                    nextCells[index].temperatureC
 
                 let airTemperature =
-                    neighbor.temperatureC
+                    nextCells[neighborIndex].temperatureC
 
                 let deltaT =
                     aluminumTemperature -
@@ -2015,96 +2502,125 @@ final class RadiatorCAEngine: ObservableObject {
                     continue
                 }
 
-                let interfaceArea =
-                    cellFaceAreaM2
-
-                let idealTransfer =
+                let interfaceTransferJ =
                     airHeatTransferCoefficient *
-                    interfaceArea *
+                    cellFaceAreaM2 *
                     deltaT *
                     thermalTimeStepS
 
-                let aluminumMass =
-                    aluminumDensityKgM3 *
-                    cellVolumeM3
-
-                let availableAluminumEnergy =
-                    max(
-                        0.0,
-                        aluminumMass *
-                        aluminumSpecificHeat *
-                        max(
-                            aluminumTemperature -
-                            ambientTemperatureC,
-                            0.0
-                        )
-                    )
-
-                let transferred =
-                    min(
-                        idealTransfer,
-                        availableAluminumEnergy
-                    )
-
-                guard transferred > 0
+                guard interfaceTransferJ > 0
                 else {
                     continue
                 }
 
-                let aluminumDeltaT =
-                    transferred /
+                let aluminumMassKg =
+                    aluminumDensityKgM3 *
+                    cellVolumeM3
+
+                let aluminumHeatCapacity =
+                    aluminumMassKg *
+                    aluminumSpecificHeat
+
+                guard aluminumHeatCapacity > 0
+                else {
+                    continue
+                }
+
+                let availableAluminumEnergyJ =
                     max(
-                        aluminumMass *
-                        aluminumSpecificHeat,
-                        1.0e-12
+                        nextCells[index].heatJ,
+                        0.0
                     )
 
-                let airMass =
+                guard availableAluminumEnergyJ > 0
+                else {
+                    continue
+                }
+
+                let transferredJ =
+                    min(
+                        interfaceTransferJ,
+                        availableAluminumEnergyJ
+                    )
+
+                guard transferredJ > 0
+                else {
+                    continue
+                }
+
+                let airMassKg =
                     airDensityKgM3 *
                     cellVolumeM3
 
-                let airDeltaT =
-                    transferred /
-                    max(
-                        airMass *
-                        airSpecificHeat,
-                        1.0e-12
-                    )
+                let airHeatCapacity =
+                    airMassKg *
+                    airSpecificHeat
 
-                nextCells[index].temperatureC =
-                    max(
-                        ambientTemperatureC,
-                        nextCells[index].temperatureC -
-                        min(
-                            aluminumDeltaT,
-                            maximumTemperatureChangePerStepC
-                        )
-                    )
-
-                nextCells[neighborIndex].temperatureC +=
-                    min(
-                        airDeltaT,
-                        maximumTemperatureChangePerStepC
-                    )
+                guard airHeatCapacity > 0
+                else {
+                    continue
+                }
 
                 nextCells[index].heatJ =
                     max(
                         0.0,
                         nextCells[index].heatJ -
-                        transferred
+                        transferredJ
+                    )
+
+                let aluminumDeltaT =
+                    transferredJ /
+                    aluminumHeatCapacity
+
+                nextCells[index].temperatureC =
+                    max(
+                        ambientTemperatureC,
+                        nextCells[index].temperatureC -
+                        aluminumDeltaT
                     )
 
                 nextCells[neighborIndex].heatJ +=
-                    transferred
+                    transferredJ
 
-                // -----------------------------------------------------
-                // CUMULATIVE ENERGY ACCOUNTING
-                // -----------------------------------------------------
+                let airDeltaT =
+                    transferredJ /
+                    airHeatCapacity
 
-                aluminumToAirEnergyJ += transferred
-                airEnergyRemovedJ += transferred
+                nextCells[neighborIndex].temperatureC +=
+                    airDeltaT
+
+                aluminumToAirThisStepJ +=
+                    transferredJ
+
+                aluminumToAirEnergyJ +=
+                    transferredJ
             }
         }
+
+        // -------------------------------------------------------------
+        // ALUMINUM → AIR DIAGNOSTIC
+        // -------------------------------------------------------------
+
+        print(
+            """
+            ALUMINUM → AIR TRANSFER
+
+            actual this step:
+            \(aluminumToAirThisStepJ) J
+
+            cumulative transfer:
+            \(aluminumToAirEnergyJ) J
+
+            transfer rate:
+            \(aluminumToAirThisStepJ /
+              max(thermalTimeStepS, 1.0e-12)) W
+
+            STATUS:
+            \(aluminumToAirThisStepJ > 0
+                ? "PASS"
+                : "FAIL")
+            """
+        )
 
         // -------------------------------------------------------------
         // 5. ADVECT WATER
@@ -2125,7 +2641,7 @@ final class RadiatorCAEngine: ObservableObject {
         )
 
         // -------------------------------------------------------------
-        // 7. NUMERICAL TEMPERATURE LIMIT
+        // 7. NUMERICAL TEMPERATURE SAFETY
         // -------------------------------------------------------------
 
         for index in nextCells.indices {
@@ -2133,10 +2649,7 @@ final class RadiatorCAEngine: ObservableObject {
             nextCells[index].temperatureC =
                 max(
                     ambientTemperatureC,
-                    min(
-                        250.0,
-                        nextCells[index].temperatureC
-                    )
+                    nextCells[index].temperatureC
                 )
         }
 
@@ -2148,7 +2661,259 @@ final class RadiatorCAEngine: ObservableObject {
             to: &nextCells
         )
 
+        // -------------------------------------------------------------
+        // 9. COMMIT
+        // -------------------------------------------------------------
+
         cells = nextCells
+
+        // -------------------------------------------------------------
+        // 10. ENERGY DISTRIBUTION
+        // -------------------------------------------------------------
+
+        let aluminumHeatJ =
+            cells.reduce(0.0) { total, cell in
+
+                guard cell.state == .aluminum
+                else {
+                    return total
+                }
+
+                return total +
+                    max(
+                        cell.heatJ,
+                        0.0
+                    )
+            }
+
+        let waterHeatJ =
+            cells.reduce(0.0) { total, cell in
+
+                guard cell.state.isWater
+                else {
+                    return total
+                }
+
+                return total +
+                    max(
+                        cell.heatJ,
+                        0.0
+                    )
+            }
+
+        let airHeatJ =
+            cells.reduce(0.0) { total, cell in
+
+                guard cell.state.isAir
+                else {
+                    return total
+                }
+
+                return total +
+                    max(
+                        cell.heatJ,
+                        0.0
+                    )
+            }
+
+        // -------------------------------------------------------------
+        // 11. ENERGY BUDGET
+        // -------------------------------------------------------------
+
+        let storedThermalEnergyJ =
+            waterHeatJ +
+            aluminumHeatJ +
+            airHeatJ
+
+        let unaccountedEnergyJ =
+            datacenterEnergyInjectedJ -
+            airEnergyRemovedJ -
+            storedThermalEnergyJ
+
+        // -------------------------------------------------------------
+        // 12. STATUS
+        // -------------------------------------------------------------
+
+        let latticeContainsHeat =
+            aluminumHeatJ > 0
+
+        let waterTransferPass =
+            waterToAluminumThisStepJ > 0
+
+        let airTransferPass =
+            aluminumToAirThisStepJ > 0
+
+        print(
+            """
+            =============================================================
+            THERMAL FIELD STATUS
+            =============================================================
+
+            Simulation time:
+            \(thermalSimulationTimeS) s
+
+            Datacenter heat injected:
+            \(datacenterEnergyInjectedJ) J
+            \(datacenterEnergyInjectedJ / 1_000_000.0) MJ
+
+            Required total:
+            \(datacenterHeatLoadJ) J
+            \(datacenterHeatLoadJ / 1_000_000.0) MJ
+
+            Remaining source energy:
+            \(max(
+                datacenterHeatLoadJ -
+                datacenterEnergyInjectedJ,
+                0.0
+            )) J
+
+            -------------------------------------------------------------
+            ENERGY DISTRIBUTION
+            -------------------------------------------------------------
+
+            Water:
+            \(waterHeatJ) J
+
+            Aluminum:
+            \(aluminumHeatJ) J
+
+            Air:
+            \(airHeatJ) J
+
+            Stored thermal energy:
+            \(storedThermalEnergyJ) J
+
+            Aluminum → air transfer:
+            \(aluminumToAirEnergyJ) J
+
+            Actual air outlet removal:
+            \(airEnergyRemovedJ) J
+
+            -------------------------------------------------------------
+            ENERGY BUDGET
+            -------------------------------------------------------------
+
+            Unaccounted:
+            \(unaccountedEnergyJ) J
+
+            -------------------------------------------------------------
+            PASS / FAIL
+            -------------------------------------------------------------
+
+            Water → aluminum:
+            \(waterTransferPass
+                ? "PASS"
+                : "FAIL")
+
+            Aluminum contains thermal energy:
+            \(latticeContainsHeat
+                ? "PASS"
+                : "FAIL")
+
+            Aluminum → air:
+            \(airTransferPass
+                ? "PASS"
+                : "FAIL")
+
+            =============================================================
+            """
+        )
+
+        printThermalEnergyBudget()
+    }
+ 
+    private var datacenterWaterInletTemperatureC: Double {
+
+        /*
+         Limit only the numerical visualization.
+
+         The underlying 1 GJ energy accounting remains unchanged.
+         */
+
+        let temperature =
+            ambientTemperatureC +
+            datacenterWaterTemperatureRiseC
+
+        return min(
+            temperature,
+            250.0
+        )
+    }
+
+    
+    private func printThermalEnergyBudget() {
+
+        let aluminumHeatJ =
+            cells.reduce(0.0) { total, cell in
+
+                guard cell.state == .aluminum
+                else {
+                    return total
+                }
+
+                return total +
+                    max(cell.heatJ, 0.0)
+            }
+
+        let waterHeatJ =
+            cells.reduce(0.0) { total, cell in
+
+                guard cell.state.isWater
+                else {
+                    return total
+                }
+
+                return total +
+                    max(cell.heatJ, 0.0)
+            }
+
+        let airHeatJ =
+            cells.reduce(0.0) { total, cell in
+
+                guard cell.state.isAir
+                else {
+                    return total
+                }
+
+                return total +
+                    max(cell.heatJ, 0.0)
+            }
+
+        print(
+            """
+            THERMAL ENERGY DISTRIBUTION
+
+            Datacenter injected:
+            \(datacenterEnergyInjectedJ) J
+
+            Water thermal energy:
+            \(waterHeatJ) J
+
+            Actual water → aluminum transfer:
+            \(waterToAluminumEnergyJ) J
+
+            Aluminum lattice thermal energy:
+            \(aluminumHeatJ) J
+
+            Aluminum → air transfer:
+            \(aluminumToAirEnergyJ) J
+
+            Air removed:
+            \(airEnergyRemovedJ) J
+
+            STATUS
+
+            Actual water → aluminum transfer:
+            \(waterToAluminumEnergyJ > 0
+                ? "PASS"
+                : "NOT SHOWN / NO TRANSFER RECORDED")
+
+            Aluminum lattice contains injected heat:
+            \(aluminumHeatJ > 0
+                ? "PASS"
+                : "NOT PROVEN")
+            """
+        )
     }
     private func resetThermalEnergyAccounting() {
 
@@ -2812,11 +3577,7 @@ final class RadiatorCAEngine: ObservableObject {
         stepCAInternal()
     }
 
-    // MARK: - Candidate Validation
 
-   
-
-    // MARK: - Network Connectivity
 
     private func verifyNetworkConnectivity(
         kind: FlowPortKind,
@@ -2992,6 +3753,7 @@ final class RadiatorCAEngine: ObservableObject {
         // ------------------------------------------------------------
         // 1. Collect aluminum touching the build platform.
         // ------------------------------------------------------------
+
         let platformAluminum: [GridPoint] =
             candidate.indices.compactMap { index in
 
@@ -3010,18 +3772,26 @@ final class RadiatorCAEngine: ObservableObject {
                 )
             }
 
-        // A printable part must have at least one aluminum contact
-        // with the build platform.
+        // A printable part must have at least one aluminum
+        // connection to the build platform.
         guard !platformAluminum.isEmpty else {
+            print("PRINTABILITY FAIL: no aluminum touches z=0 platform")
             return false
         }
 
         // ------------------------------------------------------------
-        // 2. Flood-fill aluminum from the build platform.
+        // 2. Flood-fill through the diamond structure.
+        //
+        // IMPORTANT:
+        // A diamond lattice can connect through faces, edges,
+        // and corners. Therefore this must use 26-neighbor
+        // structural connectivity.
         // ------------------------------------------------------------
+
         var visited = Set<GridPoint>()
 
         var queue = platformAluminum
+        queue.reserveCapacity(candidate.count)
 
         for point in platformAluminum {
             visited.insert(point)
@@ -3034,11 +3804,17 @@ final class RadiatorCAEngine: ObservableObject {
             let point = queue[head]
             head += 1
 
-            for neighbor in neighborPoints(point) {
+            for neighbor in allNeighborPoints(point) {
 
-                guard let neighborIndex = indexFor(neighbor),
-                      candidate[neighborIndex].state == .aluminum
-                else {
+                guard isValid(neighbor) else {
+                    continue
+                }
+
+                guard let neighborIndex = indexFor(neighbor) else {
+                    continue
+                }
+
+                guard candidate[neighborIndex].state == .aluminum else {
                     continue
                 }
 
@@ -3051,6 +3827,7 @@ final class RadiatorCAEngine: ObservableObject {
         // ------------------------------------------------------------
         // 3. Count all aluminum.
         // ------------------------------------------------------------
+
         let totalAluminum = candidate.reduce(
             into: 0
         ) { count, cell in
@@ -3061,25 +3838,37 @@ final class RadiatorCAEngine: ObservableObject {
         }
 
         guard totalAluminum > 0 else {
+            print("PRINTABILITY FAIL: no aluminum")
             return false
         }
 
         // ------------------------------------------------------------
-        // 4. All structural aluminum must be build-connected.
+        // 4. Every aluminum cell must connect to the platform.
+        //
+        // A cell is considered floating only if there is no
+        // 26-neighbor structural path back to z=0.
         // ------------------------------------------------------------
-        //
-        // This remains intentionally strict because this is the
-        // manufacturing validator.
-        //
-        // It is NOT used to control CA growth.
-        //
+
         guard visited.count == totalAluminum else {
+
+            let floatingCount =
+                totalAluminum - visited.count
+
+            print("""
+            PRINTABILITY FAIL: floating aluminum
+
+              Total aluminum: \(totalAluminum)
+              Platform-connected: \(visited.count)
+              Floating: \(floatingCount)
+            """)
+
             return false
         }
 
         // ------------------------------------------------------------
-        // 5. Require the aluminum structure to occupy the 3D volume.
+        // 5. Require genuine 3D occupation.
         // ------------------------------------------------------------
+
         let aluminumCells = candidate.filter {
             $0.state == .aluminum
         }
@@ -3097,18 +3886,41 @@ final class RadiatorCAEngine: ObservableObject {
         let minZ = aluminumCells.map(\.z).min()!
         let maxZ = aluminumCells.map(\.z).max()!
 
-        // The candidate must actually occupy all three dimensions.
         guard maxX > minX,
               maxY > minY,
               maxZ > minZ
         else {
+
+            print("""
+            PRINTABILITY FAIL: structure does not occupy 3D volume
+
+              X: \(minX)...\(maxX)
+              Y: \(minY)...\(maxY)
+              Z: \(minZ)...\(maxZ)
+            """)
+
             return false
         }
 
+        // ------------------------------------------------------------
+        // 6. PASS
+        // ------------------------------------------------------------
+
+        print("""
+        PRINTABILITY PASS
+
+          Aluminum: \(totalAluminum)
+          Platform-connected: \(visited.count)
+          Floating: 0
+
+          X: \(minX)...\(maxX)
+          Y: \(minY)...\(maxY)
+          Z: \(minZ)...\(maxZ)
+        """)
+
         return true
     }
-    // MARK: - Surface Area
-
+   
     private func calculateSurfaceArea(
         _ currentCells: [RadiatorCell]
     ) -> Double {
