@@ -4235,37 +4235,30 @@ final class RadiatorCAEngine: ObservableObject {
         _ currentCells: [RadiatorCell]
     ) -> Double {
 
-        let waterCells =
-            currentCells.reduce(
-                into: 0
-            ) { count, cell in
+        let allowableTemperatureRiseC =
+            maximumPhysicalTemperatureC -
+            waterInletTemperatureC
 
-                if cell.state.isWater {
-                    count += 1
-                }
-            }
-
-        guard waterCells > 0 else {
+        guard allowableTemperatureRiseC > 0 else {
             return 0.0
         }
 
-        /*
-         Approximate hydraulic cross section from
-         fluid voxels exposed to the primary flow direction.
-         */
-
-        let crossSection =
-            max(
-                cellFaceAreaM2,
-                Double(waterCells) /
-                Double(gridSize) *
-                cellFaceAreaM2
+        let requiredMassFlowKgS =
+            requiredHeatRateW /
+            (
+                waterSpecificHeat *
+                allowableTemperatureRiseC
             )
 
-        return crossSection *
-            nominalWaterVelocityMS
-    }
+        let requiredVolumetricFlowM3S =
+            requiredMassFlowKgS /
+            waterDensityKgM3
 
+        return max(
+            requiredVolumetricFlowM3S,
+            0.0
+        )
+    }
     private func calculateAirFlow(
         _ currentCells: [RadiatorCell]
     ) -> Double {
