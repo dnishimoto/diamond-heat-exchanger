@@ -174,33 +174,49 @@
   }
 
   struct ContentView: View {
-
+      @State private var showingAbout = false
+      @State private var isRunning = false
       @StateObject private var engine = RadiatorCAEngine()
 
       var body: some View {
-          ZStack {
-              VStack(spacing: 0) {
-                  headerRibbon
+          NavigationStack {
+              ZStack {
+                  VStack(spacing: 0) {
+                      headerRibbon
+                      scenePanel
+                      metricsRibbon
+                      controlsRibbon
+                  }
 
-                  scenePanel
-
-                  metricsRibbon
-
-                  controlsRibbon
+                  if isRunning {
+                      progressOverlay
+                          .transition(.opacity)
+                          .zIndex(100)
+                  }
               }
-
-              if engine.isRunning {
-                  progressOverlay
-                      .transition(.opacity)
+              .background(Color.black)
+              .foregroundStyle(.white)
+              .animation(
+                  .easeInOut(duration: 0.20),
+                  value: isRunning
+              )
+              .navigationTitle("Diamond Heat Exchanger")
+              .navigationBarTitleDisplayMode(.inline)
+              .toolbar {
+                  ToolbarItem(placement: .topBarTrailing) {
+                      Button {
+                          showingAbout = true
+                      } label: {
+                          Image(systemName: "info.circle")
+                      }
+                      .help("About the Diamond Heat Exchanger")
+                  }
+              }
+              .sheet(isPresented: $showingAbout) {
+                  AboutView()
               }
           }
-          .background(Color.black)
-          .foregroundStyle(.white)
           .preferredColorScheme(.dark)
-          .animation(
-              .easeInOut(duration: 0.20),
-              value: engine.isRunning
-          )
       }
 
       // MARK: - Header Ribbon
@@ -225,10 +241,7 @@
                   .foregroundStyle(.secondary)
               }
 
-              Spacer()
-
-              statusBadge
-          }
+           }
           .padding(.horizontal, 16)
           .padding(.vertical, 10)
           .background(Color(white: 0.075))
@@ -238,36 +251,10 @@
           }
       }
 
-      private var statusBadge: some View {
-          HStack(spacing: 6) {
-              Circle()
-                  .fill(statusColor)
-                  .frame(width: 8, height: 8)
 
-              Text(statusText)
-                  .font(.caption2.bold())
-                  .foregroundStyle(statusColor)
-          }
-          .padding(.horizontal, 9)
-          .padding(.vertical, 6)
-          .background(
-              statusColor.opacity(0.13),
-              in: Capsule()
-          )
-      }
-
-      private var statusText: String {
-          if engine.isRunning {
-              return "RUNNING"
-          }
-
-          return designIsValid
-              ? "VALID"
-              : "CHECK DESIGN"
-      }
-
+     
       private var statusColor: Color {
-          if engine.isRunning {
+          if isRunning {
               return .cyan
           }
 
@@ -607,21 +594,17 @@
                   )
               }
               .buttonStyle(.bordered)
-              .disabled(engine.isRunning)
+              .disabled(isRunning)
+
+             
 
               Button {
-                  engine.evolve(generations: 1)
-              } label: {
-                  Label(
-                      "Step",
-                      systemImage: "forward.frame.fill"
-                  )
-              }
-              .buttonStyle(.bordered)
-              .disabled(engine.isRunning)
+                  isRunning = true
 
-              Button {
-                  engine.evolve(generations: 20)
+                  Task {
+                      await engine.evolve(generations:25)
+                      isRunning = false
+                  }
               } label: {
                   Label(
                       "Run",
@@ -629,20 +612,10 @@
                   )
               }
               .buttonStyle(.borderedProminent)
-              .disabled(engine.isRunning)
+              .disabled(isRunning)
+            
 
-              Button {
-                  engine.optimize(generations: 50)
-              } label: {
-                  Label(
-                      "Optimize",
-                      systemImage: "wand.and.stars"
-                  )
-              }
-              .buttonStyle(.bordered)
-              .disabled(engine.isRunning)
-
-              if engine.isRunning {
+              if isRunning {
                   Button(
                       role: .destructive
                   ) {
@@ -656,24 +629,7 @@
                   .buttonStyle(.bordered)
               }
 
-              Spacer()
-
-              Group {
-                  if engine.isRunning {
-                      ProgressView()
-                          .controlSize(.small)
-
-                      Text(
-                          "Evaluating generation \(engine.generation)"
-                      )
-                  } else {
-                      Text(
-                          "Step = one CA update • Run = 20 updates"
-                      )
-                  }
-              }
-              .font(.caption)
-              .foregroundStyle(.secondary)
+        
           }
           .padding(.horizontal, 14)
           .padding(.vertical, 9)
@@ -684,31 +640,79 @@
           }
       }
 
-      // MARK: - Progress Overlay
-
+  
       private var progressOverlay: some View {
           ZStack {
               Color.black
-                  .opacity(0.32)
+                  .opacity(0.42)
                   .ignoresSafeArea()
                   .allowsHitTesting(false)
 
-              VStack(spacing: 12) {
-                  ProgressView()
-                      .controlSize(.large)
+              VStack(spacing: 16) {
+
+                  HStack(spacing: 10) {
+                      ProgressView()
+                          .controlSize(.large)
+                          .tint(.cyan)
+
+                      Text("CA Simulation Running")
+                          .font(.headline.bold())
+                  }
+
+                  VStack(spacing: 8) {
+
+                      HStack {
+                          Text("Generation")
+                              .font(.caption)
+                              .foregroundStyle(.secondary)
+
+                          Spacer()
+
+                          Text(
+                              "\(engine.generation) / \(engine.totalGenerations)"
+                          )
+                          .font(
+                              .system(
+                                  .caption,
+                                  design: .monospaced
+                              )
+                              .bold()
+                          )
+                          .foregroundStyle(.cyan)
+                      }
+
+                      ProgressView(
+                          value: engine.generationProgress,
+                          total: 1.0
+                      )
+                      .progressViewStyle(.linear)
                       .tint(.cyan)
 
-                  Text("Simulation Running")
-                      .font(.headline)
+                      HStack {
+                          Text(
+                              String(
+                                  format: "%.0f%%",
+                                  engine.generationProgress * 100.0
+                              )
+                          )
+                          .font(
+                              .system(
+                                  .caption2,
+                                  design: .monospaced
+                              )
+                          )
+                          .foregroundStyle(.cyan)
+
+                          Spacer()
+
+                          Text("Optimizing radiator")
+                              .font(.caption2)
+                              .foregroundStyle(.secondary)
+                      }
+                  }
 
                   Text(
-                      "Evaluating generation \(engine.generation)"
-                  )
-                  .font(.subheadline)
-                  .foregroundStyle(.secondary)
-
-                  Text(
-                      "The scene remains visible and updates after each CA generation."
+                      "Evaluating aluminum deposition, water and air connectivity, thermal transfer, and flow resistance."
                   )
                   .font(.caption)
                   .foregroundStyle(.secondary)
@@ -727,26 +731,28 @@
                   .buttonStyle(.borderedProminent)
                   .tint(.red)
               }
-              .padding(22)
-              .frame(width: 310)
+              .padding(24)
+              .frame(width: 350)
               .background(
                   Color(white: 0.10),
                   in: RoundedRectangle(
-                      cornerRadius: 16
+                      cornerRadius: 18
                   )
               )
               .overlay {
                   RoundedRectangle(
-                      cornerRadius: 16
+                      cornerRadius: 18
                   )
                   .stroke(
-                      Color.cyan.opacity(0.32),
+                      Color.cyan.opacity(0.35),
                       lineWidth: 1
                   )
               }
+              .shadow(
+                  radius: 20
+              )
           }
       }
-
       // MARK: - Formatting
 
       private var temperatureColor: Color {

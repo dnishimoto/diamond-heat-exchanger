@@ -15,6 +15,14 @@ import Foundation
 @MainActor
 final class RadiatorCAEngine: ObservableObject {
     
+    private let aluminumSpecificHeat = 897.0       // J/(kg·K)
+    private let waterSpecificHeat = 4186.0         // J/(kg·K)
+   
+    private let maximumPhysicalTemperatureC = 120.0
+    
+    @Published private(set) var generationProgress: Double = 0.0
+    @Published private(set) var totalGenerations: Int = 0
+    
     private var cellVolumeM3: Double {
         cellSizeM * cellSizeM * cellSizeM
     }
@@ -87,19 +95,15 @@ final class RadiatorCAEngine: ObservableObject {
 
     private let aluminumDensityKgM3 = 2700.0
     private let aluminumThermalConductivity = 237.0
-    private let aluminumSpecificHeat = 897.0
-
+ 
     // MARK: - Water
 
     private let waterDensityKgM3 = 998.0
-    private let waterSpecificHeat = 4186.0
-
+  
     // MARK: - Air
 
     private let airDensityKgM3 = 1.225
-    private let airSpecificHeat = 1005.0
-
-    // MARK: - Datacenter Thermal Load
+     // MARK: - Datacenter Thermal Load
 
     /*
      The datacenter contributes 1 GJ of thermal energy.
@@ -112,9 +116,6 @@ final class RadiatorCAEngine: ObservableObject {
         datacenterHeatLoadJ / targetRemovalTimeS
     }
 
-    // MARK: - Ambient Conditions
-
-    private let maximumAllowedTemperatureC = 120.0
 
     // MARK: - Nominal Flow Velocities
 
@@ -194,23 +195,23 @@ final class RadiatorCAEngine: ObservableObject {
         generations: Int = 1
     ) {
 
-        guard !isRunning else {
+        guard !self.isRunning else {
             return
         }
 
-        isRunning = true
+        self.isRunning = true
 
         for _ in 0..<max(1, generations) {
 
             stepCA()
         }
 
-        isRunning = false
+        self.isRunning = false
     }
 
     func stop() {
 
-        isRunning = false
+        self.isRunning = false
 
         applyPortStates()
 
@@ -219,27 +220,38 @@ final class RadiatorCAEngine: ObservableObject {
 
     func evolve(
         generations: Int = 20
-    ) {
+    ) async {
 
-        guard !isRunning else {
+        guard !self.isRunning else {
             return
         }
+        totalGenerations = generations
+           generationProgress = 0.0
 
-        isRunning = true
+        self.isRunning = true
 
-        for _ in 0..<max(0, generations) {
-
+        for generationIndex in 0..<max(0, generations) {
+            await Task.yield()
             stepCA()
-        }
 
-        isRunning = false
+            generationProgress =
+                Double(generationIndex + 1) /
+                Double(max(generations, 1))
+            
+         
+           
+        }
+        
+        generationProgress = 1.0
+
+        self.isRunning = false
     }
 
     // MARK: - Reset
 
     func reset() {
 
-        isRunning = false
+        self.isRunning = false
 
         datacenterEnergyInjectedJ = 0.0
 
@@ -308,7 +320,59 @@ final class RadiatorCAEngine: ObservableObject {
             z: z
         )
     }
+    private func updateTemperature(
+        for cell: inout RadiatorCell
+    ) {
 
+        let capacity =
+            heatCapacityJPerK(for: cell)
+
+        guard capacity > 0,
+              capacity.isFinite else {
+            cell.temperatureC = ambientTemperatureC
+            return
+        }
+
+        let energyJ =
+            max(0.0, cell.heatJ)
+
+        let deltaTemperatureC =
+            energyJ / capacity
+
+        cell.temperatureC =
+            min(
+                ambientTemperatureC + deltaTemperatureC,
+                maximumPhysicalTemperatureC
+            )
+    }
+    private func heatCapacityJPerK(
+        for cell: RadiatorCell
+    ) -> Double {
+
+        switch cell.state {
+
+        case .aluminum:
+            let massKg =
+                aluminumDensityKgM3 * cellVolumeM3
+
+            return massKg * aluminumSpecificHeat
+
+        case .water, .waterInlet, .waterOutlet:
+            let massKg =
+                waterDensityKgM3 * cellVolumeM3
+
+            return massKg * waterSpecificHeat
+
+        case .air, .airInlet, .airOutlet:
+            let massKg =
+                airDensityKgM3 * cellVolumeM3
+
+            return massKg * airSpecificHeatJPerKgK
+
+        case .empty:
+            return 0.0
+        }
+    }
     private func isValid(
         _ point: GridPoint
     ) -> Bool {
@@ -459,7 +523,7 @@ final class RadiatorCAEngine: ObservableObject {
             return waterCellMassKg * waterSpecificHeat
 
         case .air, .airInlet, .airOutlet:
-            return airCellMassKg * airSpecificHeat
+            return airCellMassKg * airSpecificHeatJPerKgK
 
         default:
             return 0.0
@@ -1763,9 +1827,7 @@ final class RadiatorCAEngine: ObservableObject {
         }
 
         guard !inletPorts.isEmpty else {
-            print(
-                "FAIL: No water inlet ports available."
-            )
+            print("FAIL: No water inlet ports available.")
             return
         }
 
@@ -1775,39 +1837,28 @@ final class RadiatorCAEngine: ObservableObject {
                 0.0
             )
 
-        let massFlowKgS =
-            max(
-                waterFlowM3S * waterDensityKgM3,
-                0.000001
+        // Do not convert negligible water flow into
+        // an enormous temperature.
+        guard waterFlowM3S > 1.0e-9 else {
+            print(
+                """
+                FAIL: Insufficient water inflow.
+                Water flow: \(waterFlowM3S) m³/s
+                Heat injection skipped.
+                """
             )
-
-        let waterMassThisStepKg =
-            massFlowKgS * thermalTimeStepS
-
-        guard waterMassThisStepKg > 0 else {
             return
         }
-
-        let temperatureRiseC =
-            timestepEnergyJ /
-            max(
-                waterMassThisStepKg *
-                waterSpecificHeat,
-                1.0e-12
-            )
-
-        let inletTemperatureC =
-            ambientTemperatureC +
-            temperatureRiseC
 
         let energyPerInletJ =
             timestepEnergyJ /
             Double(inletPorts.count)
 
+        var acceptedEnergyJ = 0.0
+
         for port in inletPorts {
 
-            guard let index =
-                    indexFor(port.point)
+            guard let index = indexFor(port.point)
             else {
                 continue
             }
@@ -1820,41 +1871,23 @@ final class RadiatorCAEngine: ObservableObject {
             cells[index].heatJ +=
                 energyPerInletJ
 
-            cells[index].temperatureC =
-                inletTemperatureC
+            // temperatureC is derived from heatJ.
+            updateTemperature(
+                for: &cells[index]
+            )
+
+            acceptedEnergyJ +=
+                energyPerInletJ
         }
 
         datacenterEnergyInjectedJ +=
-            timestepEnergyJ
+            acceptedEnergyJ
 
         datacenterEnergyInjectedJ =
             min(
                 datacenterEnergyInjectedJ,
                 datacenterHeatLoadJ
             )
-
-        print(
-            """
-            DATACENTER HEAT INJECTION
-
-            injected this step: \(timestepEnergyJ) J
-
-            total injected: \(datacenterEnergyInjectedJ) J
-
-            remaining:
-            \(datacenterHeatLoadJ -
-              datacenterEnergyInjectedJ) J
-
-            inlet temperature:
-            \(inletTemperatureC) °C
-
-            water flow:
-            \(waterFlowM3S) m³/s
-
-            mass flow:
-            \(massFlowKgS) kg/s
-            """
-        )
     }
     private func restoreWaterChannelWalls(
         in cells: inout [RadiatorCell]
@@ -1958,6 +1991,9 @@ final class RadiatorCAEngine: ObservableObject {
 
         // -------------------------------------------------------------
         // 1. DATACENTER → WATER
+        //
+        // heatJ is authoritative.
+        // temperatureC is derived from heatJ.
         // -------------------------------------------------------------
 
         applyWaterInletTemperature(
@@ -1972,8 +2008,6 @@ final class RadiatorCAEngine: ObservableObject {
         //     cell.heatJ
         //
         // ONLY.
-        //
-        // cell.temperatureC is NOT used for aluminum.
         // -------------------------------------------------------------
 
         var waterToAluminumThisStepJ = 0.0
@@ -1999,19 +2033,15 @@ final class RadiatorCAEngine: ObservableObject {
         var waterCellCount = 0
         var waterInletCellCount = 0
         var waterOutletCellCount = 0
-
         var coldWaterCellCount = 0
         var waterWithNoStoredEnergyCount = 0
         var waterWithNoCapacityCount = 0
-
         var neighborCheckCount = 0
         var missingNeighborIndexCount = 0
-
         var waterNeighborCount = 0
         var airNeighborCount = 0
         var aluminumNeighborCount = 0
         var otherNeighborStateCount = 0
-
         var positiveDeltaTCount = 0
         var nonPositiveDeltaTCount = 0
         var positiveInterfaceTransferCount = 0
@@ -2065,17 +2095,21 @@ final class RadiatorCAEngine: ObservableObject {
                 }
 
                 // -----------------------------------------------------
-                // WATER MAY STILL USE temperatureC.
+                // WATER TEMPERATURE
                 //
-                // Aluminum does NOT.
+                // temperatureC is derived from heatJ.
                 // -----------------------------------------------------
 
+                updateTemperature(
+                    for: &nextCells[index]
+                )
+
                 let waterTemperature =
-                    waterCell.temperatureC
+                    nextCells[index].temperatureC
 
                 let availableWaterEnergyJ =
                     max(
-                        waterCell.heatJ,
+                        nextCells[index].heatJ,
                         0.0
                     )
 
@@ -2094,7 +2128,7 @@ final class RadiatorCAEngine: ObservableObject {
                         \(String(describing: pointFor(index)))
 
                         state:
-                        \(String(describing: waterCell.state))
+                        \(String(describing: nextCells[index].state))
 
                         water temperature:
                         \(waterTemperature) °C
@@ -2111,14 +2145,12 @@ final class RadiatorCAEngine: ObservableObject {
                 guard waterTemperature >
                         ambientTemperatureC
                 else {
-
                     coldWaterCellCount += 1
                     continue
                 }
 
                 guard availableWaterEnergyJ > 0
                 else {
-
                     waterWithNoStoredEnergyCount += 1
                     continue
                 }
@@ -2133,7 +2165,6 @@ final class RadiatorCAEngine: ObservableObject {
 
                 guard waterHeatCapacity > 0
                 else {
-
                     waterWithNoCapacityCount += 1
                     continue
                 }
@@ -2154,7 +2185,6 @@ final class RadiatorCAEngine: ObservableObject {
                     guard let neighborIndex =
                             indexFor(neighborPoint)
                     else {
-
                         missingNeighborIndexCount += 1
                         continue
                     }
@@ -2200,15 +2230,14 @@ final class RadiatorCAEngine: ObservableObject {
 
                     guard aluminumHeatCapacity > 0
                     else {
-
                         noAluminumCapacityCount += 1
                         continue
                     }
 
                     // -------------------------------------------------
-                    // ALUMINUM TEMPERATURE DERIVED FROM heatJ ONLY
+                    // ALUMINUM TEMPERATURE
                     //
-                    // This is NOT stored back into cell.temperatureC.
+                    // Derived ONLY from heatJ.
                     // -------------------------------------------------
 
                     let aluminumHeatJ =
@@ -2228,7 +2257,8 @@ final class RadiatorCAEngine: ObservableObject {
 
                         print(
                             """
-                            WATER → ALUMINUM DEBUG: FIRST ALUMINUM NEIGHBOR
+                            WATER → ALUMINUM DEBUG:
+                            FIRST ALUMINUM NEIGHBOR
 
                             water index:
                             \(index)
@@ -2267,7 +2297,6 @@ final class RadiatorCAEngine: ObservableObject {
 
                     guard deltaT > 0
                     else {
-
                         nonPositiveDeltaTCount += 1
                         continue
                     }
@@ -2304,7 +2333,6 @@ final class RadiatorCAEngine: ObservableObject {
 
                     guard transferredJ > 0
                     else {
-
                         zeroTransferredEnergyCount += 1
                         continue
                     }
@@ -2315,7 +2343,8 @@ final class RadiatorCAEngine: ObservableObject {
 
                         print(
                             """
-                            WATER → ALUMINUM DEBUG: FIRST TRANSFER
+                            WATER → ALUMINUM DEBUG:
+                            FIRST TRANSFER
 
                             water index:
                             \(index)
@@ -2349,6 +2378,8 @@ final class RadiatorCAEngine: ObservableObject {
 
                     // -------------------------------------------------
                     // REMOVE ENERGY FROM WATER
+                    //
+                    // heatJ is authoritative.
                     // -------------------------------------------------
 
                     nextCells[index].heatJ =
@@ -2358,22 +2389,15 @@ final class RadiatorCAEngine: ObservableObject {
                             transferredJ
                         )
 
-                    // Water temperature remains a fluid-state value.
-                    let waterDeltaT =
-                        transferredJ /
-                        waterHeatCapacity
-
-                    nextCells[index].temperatureC =
-                        max(
-                            ambientTemperatureC,
-                            nextCells[index].temperatureC -
-                            waterDeltaT
-                        )
+                    // Derive water temperature from remaining heat.
+                    updateTemperature(
+                        for: &nextCells[index]
+                    )
 
                     // -------------------------------------------------
                     // ADD ENERGY TO ALUMINUM
                     //
-                    // THIS IS THE ONLY ALUMINUM THERMAL UPDATE.
+                    // heatJ is the ONLY aluminum thermal state.
                     // -------------------------------------------------
 
                     nextCells[neighborIndex].heatJ +=
@@ -2513,10 +2537,6 @@ final class RadiatorCAEngine: ObservableObject {
         // 3. ALUMINUM ↔ ALUMINUM CONDUCTION
         //
         // HEATJ ONLY.
-        //
-        // No aluminum temperatureC is read.
-        // No aluminum temperatureC is written.
-        // No synchronizeCellHeat() is called.
         // -------------------------------------------------------------
 
         for index in nextCells.indices {
@@ -2566,16 +2586,6 @@ final class RadiatorCAEngine: ObservableObject {
                 else {
                     continue
                 }
-
-                // -----------------------------------------------------
-                // ENERGY-BASED CONDUCTION
-                //
-                // Positive:
-                //     B → A
-                //
-                // Negative:
-                //     A → B
-                // -----------------------------------------------------
 
                 let requestedTransferJ =
                     heatDifference *
@@ -2634,6 +2644,7 @@ final class RadiatorCAEngine: ObservableObject {
         // 4. ALUMINUM → AIR
         //
         // Aluminum temperature is derived ONLY from heatJ.
+        // Air receives energy through heatJ.
         // -------------------------------------------------------------
 
         var aluminumToAirThisStepJ = 0.0
@@ -2669,12 +2680,6 @@ final class RadiatorCAEngine: ObservableObject {
                 continue
             }
 
-            // ---------------------------------------------------------
-            // DERIVED VALUE ONLY
-            //
-            // This value is never written to cell.temperatureC.
-            // ---------------------------------------------------------
-
             let aluminumTemperature =
                 ambientTemperatureC +
                 aluminumHeatJ /
@@ -2695,6 +2700,16 @@ final class RadiatorCAEngine: ObservableObject {
                 else {
                     continue
                 }
+
+                // -----------------------------------------------------
+                // AIR TEMPERATURE
+                //
+                // Derive from heatJ before calculating ΔT.
+                // -----------------------------------------------------
+
+                updateTemperature(
+                    for: &nextCells[neighborIndex]
+                )
 
                 let airTemperature =
                     nextCells[neighborIndex].temperatureC
@@ -2736,19 +2751,6 @@ final class RadiatorCAEngine: ObservableObject {
                     continue
                 }
 
-                let airMassKg =
-                    airDensityKgM3 *
-                    cellVolumeM3
-
-                let airHeatCapacity =
-                    airMassKg *
-                    airSpecificHeat
-
-                guard airHeatCapacity > 0
-                else {
-                    continue
-                }
-
                 // -----------------------------------------------------
                 // ALUMINUM → AIR ENERGY TRANSFER
                 // -----------------------------------------------------
@@ -2763,13 +2765,10 @@ final class RadiatorCAEngine: ObservableObject {
                 nextCells[neighborIndex].heatJ +=
                     transferredJ
 
-                // Air temperature may use its own fluid thermal state.
-                let airDeltaT =
-                    transferredJ /
-                    airHeatCapacity
-
-                nextCells[neighborIndex].temperatureC +=
-                    airDeltaT
+                // Air temperature is derived from its new heatJ.
+                updateTemperature(
+                    for: &nextCells[neighborIndex]
+                )
 
                 aluminumToAirThisStepJ +=
                     transferredJ
@@ -2846,23 +2845,20 @@ final class RadiatorCAEngine: ObservableObject {
         // -------------------------------------------------------------
         // 8. NUMERICAL SAFETY
         //
-        // Only fluid temperatures are clamped here.
-        //
-        // Aluminum energy is NOT modified.
+        // Fluid temperature is derived from heatJ.
+        // Aluminum energy is not modified.
         // -------------------------------------------------------------
 
         for index in nextCells.indices {
 
-            guard nextCells[index].state != .aluminum
+            guard nextCells[index].state != .empty
             else {
                 continue
             }
 
-            nextCells[index].temperatureC =
-                max(
-                    ambientTemperatureC,
-                    nextCells[index].temperatureC
-                )
+            updateTemperature(
+                for: &nextCells[index]
+            )
         }
 
         // -------------------------------------------------------------
@@ -3042,7 +3038,50 @@ final class RadiatorCAEngine: ObservableObject {
         thermalSimulationTimeS +=
             thermalTimeStepS
     }
-  
+    private func addHeat(
+        _ requestedEnergyJ: Double,
+        to cell: inout RadiatorCell
+    ) -> Double {
+
+        guard requestedEnergyJ.isFinite,
+              requestedEnergyJ > 0 else {
+            return 0.0
+        }
+
+        let capacity =
+            heatCapacityJPerK(for: cell)
+
+        guard capacity > 0 else {
+            return 0.0
+        }
+
+        let maximumAllowedEnergyJ =
+            max(
+                0.0,
+                (maximumPhysicalTemperatureC - ambientTemperatureC)
+                * capacity
+            )
+
+        let availableCapacityJ =
+            max(
+                0.0,
+                maximumAllowedEnergyJ - cell.heatJ
+            )
+
+        let acceptedEnergyJ =
+            min(
+                requestedEnergyJ,
+                availableCapacityJ
+            )
+
+        cell.heatJ += acceptedEnergyJ
+
+        updateTemperature(
+            for: &cell
+        )
+
+        return acceptedEnergyJ
+    }
     private func calculateStoredEnergyByMaterial(
         in lattice: [RadiatorCell]
     ) -> (
@@ -4313,6 +4352,9 @@ final class RadiatorCAEngine: ObservableObject {
         guard thermalTimeStepS > 1e-12 else { return 0.0 }
         return airEnergyRemovedThisStepJ / thermalTimeStepS
     }
+ 
+  
+    
     private func transferWaterToAluminum() {
 
         let dt = thermalTimeStepS
@@ -4323,8 +4365,10 @@ final class RadiatorCAEngine: ObservableObject {
                 continue
             }
 
-            let waterTemperature =
-                cells[index].temperatureC
+            // Keep temperature synchronized with authoritative heatJ.
+            updateTemperature(
+                for: &cells[index]
+            )
 
             let point = pointFor(index)
 
@@ -4341,6 +4385,14 @@ final class RadiatorCAEngine: ObservableObject {
                     continue
                 }
 
+                // Keep aluminum temperature synchronized with heatJ.
+                updateTemperature(
+                    for: &cells[aluminumIndex]
+                )
+
+                let waterTemperature =
+                    cells[index].temperatureC
+
                 let aluminumTemperature =
                     cells[aluminumIndex].temperatureC
 
@@ -4352,43 +4404,68 @@ final class RadiatorCAEngine: ObservableObject {
                     continue
                 }
 
-                // Heat-transfer rate:
-                //
-                // Qdot = h * A * ΔT
+                // Qdot = h × A × ΔT
                 let heatTransferRateW =
                     waterToAluminumHeatTransferCoefficient *
                     cellFaceAreaM2 *
                     deltaTemperature
 
-                // Energy transferred during this timestep:
-                //
-                // ΔE = Qdot * dt
-                let transferredEnergyJ =
+                let requestedEnergyJ =
                     heatTransferRateW * dt
 
+                guard requestedEnergyJ > 0 else {
+                    continue
+                }
+
+                // Never remove more energy than the water contains.
+                let availableWaterEnergyJ =
+                    max(
+                        cells[index].heatJ,
+                        0.0
+                    )
+
+                let transferEnergyJ =
+                    min(
+                        requestedEnergyJ,
+                        availableWaterEnergyJ
+                    )
+
+                guard transferEnergyJ > 0 else {
+                    continue
+                }
+
+                // WATER → ALUMINUM
+                //
+                // addHeat() enforces the aluminum temperature/energy
+                // limit and returns the energy actually accepted.
+                let acceptedEnergyJ =
+                    addHeat(
+                        transferEnergyJ,
+                        to: &cells[aluminumIndex]
+                    )
+
+                guard acceptedEnergyJ > 0 else {
+                    continue
+                }
+
+                // Remove only the energy actually accepted by aluminum.
+                cells[index].heatJ =
+                    max(
+                        0.0,
+                        cells[index].heatJ -
+                        acceptedEnergyJ
+                    )
+
+                // Recalculate water temperature after its heatJ changed.
+                updateTemperature(
+                    for: &cells[index]
+                )
+
                 waterToAluminumEnergyJ +=
-                    Double(transferredEnergyJ)
-
-                // Store the transferred energy in aluminum.
-                cells[aluminumIndex].heatJ +=
-                    transferredEnergyJ
-
-                // Convert that energy into an aluminum
-                // temperature increase.
-                let aluminumMass =
-                    aluminumDensityKgM3 *
-                    cellVolumeM3
-
-                let temperatureIncrease =
-                    transferredEnergyJ /
-                    (aluminumMass * aluminumSpecificHeat)
-
-                cells[aluminumIndex].temperatureC +=
-                    temperatureIncrease
+                    acceptedEnergyJ
             }
         }
     }
-    // MARK: - Evaluation
 
     private func evaluateSimulation() {
         
@@ -4609,7 +4686,7 @@ final class RadiatorCAEngine: ObservableObject {
 
         let airTemperatureRiseC =
             m.heatRejectedW /
-            (safeAirMassFlowKgS * airSpecificHeat)
+            (safeAirMassFlowKgS * airSpecificHeatJPerKgK)
 
         m.airTemperatureRiseC =
             airTemperatureRiseC
@@ -4765,7 +4842,7 @@ final class RadiatorCAEngine: ObservableObject {
             max(
                 0.0,
                 m.maximumTemperatureC -
-                maximumAllowedTemperatureC
+                maximumPhysicalTemperatureC
             ) * 10.0
 
         /*
